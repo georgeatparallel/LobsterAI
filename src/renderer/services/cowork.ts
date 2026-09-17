@@ -2241,14 +2241,15 @@ class CoworkService {
       }
       store.dispatch(setPermissionSubmissionState({ requestId,
         phase: !approval || response.outcome?.kind === 'known_not_applied' ? undefined : 'unknown',
-        error: i18nService.t(response.outcome?.kind === 'known_not_applied' ? 'coworkApprovalNotApplied' : 'coworkApprovalUnknown'),
+        error: i18nService.t(!approval ? 'coworkQuestionSubmitFailed'
+          : response.outcome?.kind === 'known_not_applied' ? 'coworkApprovalNotApplied' : 'coworkApprovalUnknown'),
       }));
       return false;
     } catch {
       // IPC cancellation/disconnect is not evidence that the runtime did not apply it.
       if (!sameAccountContext(account, store.getState().auth)) return false;
       store.dispatch(setPermissionSubmissionState({ requestId, phase: approval ? 'unknown' : undefined,
-        error: i18nService.t(approval ? 'coworkApprovalUnknown' : 'coworkApprovalNotApplied') }));
+        error: i18nService.t(approval ? 'coworkApprovalUnknown' : 'coworkQuestionSubmitFailed') }));
       return false;
     }
   }

@@ -36,9 +36,15 @@ export type AskUserRequest = {
   }>;
 };
 
+export const AskUserResponseReason = {
+  Timeout: 'timeout',
+  Unavailable: 'unavailable',
+} as const;
+
 export type AskUserResponse = {
   behavior: 'allow' | 'deny';
   answers?: Record<string, string>;
+  reason?: typeof AskUserResponseReason[keyof typeof AskUserResponseReason];
 };
 
 type PendingAskUser = {
@@ -135,12 +141,14 @@ export class McpBridgeServer {
   /**
    * Resolve a pending AskUserQuestion request (called when user clicks in the modal).
    */
-  resolveAskUser(requestId: string, response: AskUserResponse): void {
+  resolveAskUser(requestId: string, response: AskUserResponse): boolean {
     const pending = this.pendingAskUser.get(requestId);
-    if (!pending) return;
+    if (!pending) return false;
     clearTimeout(pending.timer);
     this.pendingAskUser.delete(requestId);
     pending.resolve(response);
+    this.onAskUserDismissCallback?.(requestId);
+    return true;
   }
 
   /**
@@ -160,9 +168,7 @@ export class McpBridgeServer {
     return new Promise<AskUserResponse>((resolve) => {
       const timer = setTimeout(() => {
         log('INFO', `AskUser (internal) timeout, requestId=${requestId}`);
-        this.pendingAskUser.delete(requestId);
-        this.onAskUserDismissCallback?.(requestId);
-        resolve({ behavior: 'deny' });
+        this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Timeout });
       }, timeoutMs);
 
       this.pendingAskUser.set(requestId, { requestId, resolve, timer });
@@ -171,9 +177,7 @@ export class McpBridgeServer {
         this.onAskUserCallback({ requestId, questions, sessionKey });
       } else {
         log('WARN', 'AskUser callback not registered, denying (internal)');
-        clearTimeout(timer);
-        this.pendingAskUser.delete(requestId);
-        resolve({ behavior: 'deny' });
+        this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Unavailable });
       }
     });
   }
@@ -294,9 +298,7 @@ export class McpBridgeServer {
       const userResponse = await new Promise<AskUserResponse>((resolve) => {
         const timer = setTimeout(() => {
           log('INFO', `AskUser timeout, requestId=${requestId}`);
-          this.pendingAskUser.delete(requestId);
-          this.onAskUserDismissCallback?.(requestId);
-          resolve({ behavior: 'deny' });
+          this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Timeout });
         }, ASKUSER_TIMEOUT_MS);
 
         this.pendingAskUser.set(requestId, { requestId, resolve, timer });
@@ -310,9 +312,7 @@ export class McpBridgeServer {
           });
         } else {
           log('WARN', 'AskUser callback not registered, denying');
-          clearTimeout(timer);
-          this.pendingAskUser.delete(requestId);
-          resolve({ behavior: 'deny' });
+          this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Unavailable });
         }
       });
 

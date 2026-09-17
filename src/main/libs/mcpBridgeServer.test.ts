@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { type AskUserRequest, McpBridgeServer } from './mcpBridgeServer';
+import { type AskUserRequest, AskUserResponseReason, McpBridgeServer } from './mcpBridgeServer';
 
 const makeQuestions = (): AskUserRequest['questions'] => [{
   question: 'Continue?',
@@ -64,6 +64,50 @@ describe('McpBridgeServer AskUser session attribution', () => {
 
     expect(received).toHaveLength(1);
     expect(received[0].sessionKey).toBe('agent:main:lobsterai:session-b');
+  });
+});
+
+describe('McpBridgeServer AskUser response lifecycle', () => {
+  afterEach(() => vi.useRealTimers());
+
+  test.each(['allow', 'deny'] as const)('settles %s once and dismisses the dialog', async behavior => {
+    vi.useFakeTimers();
+    const server = new McpBridgeServer('test-secret');
+    const dismiss = vi.fn();
+    let requestId = '';
+    server.onAskUser(request => { requestId = request.requestId; });
+    server.onAskUserDismiss(dismiss);
+    const response = server.askUserInternal(makeQuestions(), 1_000);
+
+    expect(server.resolveAskUser(requestId, { behavior })).toBe(true);
+    await expect(response).resolves.toEqual({ behavior });
+    expect(server.resolveAskUser(requestId, { behavior })).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(dismiss).toHaveBeenCalledExactlyOnceWith(requestId);
+  });
+
+  test('reports timeout separately from user refusal and rejects a late response', async () => {
+    vi.useFakeTimers();
+    const server = new McpBridgeServer('test-secret');
+    const dismiss = vi.fn();
+    let requestId = '';
+    server.onAskUser(request => { requestId = request.requestId; });
+    server.onAskUserDismiss(dismiss);
+    const response = server.askUserInternal(makeQuestions(), 1_000);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(response).resolves.toEqual({ behavior: 'deny', reason: AskUserResponseReason.Timeout });
+    expect(server.resolveAskUser(requestId, { behavior: 'allow' })).toBe(false);
+    expect(dismiss).toHaveBeenCalledExactlyOnceWith(requestId);
+  });
+
+  test('reports an unavailable dialog handler separately from user refusal', async () => {
+    const server = new McpBridgeServer('test-secret');
+
+    await expect(server.askUserInternal(makeQuestions())).resolves.toEqual({
+      behavior: 'deny', reason: AskUserResponseReason.Unavailable,
+    });
   });
 });
 

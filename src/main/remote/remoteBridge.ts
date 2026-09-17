@@ -10,6 +10,7 @@ import { REMOTE_AGENT_CATALOG_BYTES, REMOTE_AGENT_CATALOG_ITEMS, REMOTE_PROTOCOL
 import { RemoteFileCapability } from '../../shared/remote/files';
 import { RemoteInputCapability, RemoteInputReason, RemoteInputStatus, type RemotePreparationClaim } from '../../shared/remote/input';
 import { REMOTE_REPLY_PROJECTION_VERSION, REMOTE_REPLY_SYNC_DELAY_MS,RemoteReplyCapability } from '../../shared/remote/reply';
+import { RemoteRetention, type RetentionImport, type RetentionState } from '../../shared/remote/retention';
 import type { AgentOwnerStore } from '../agentOwnership';
 import { OwnershipAssociationStore, type OwnershipClaimBlocks } from '../ownershipAssociationStore';
 import { payloadHash, remoteError, sameOwner, stableJson } from './canonical';
@@ -20,12 +21,13 @@ import { approvalCommandError, RemoteApprovalError } from './remoteApproval';
 import { RemoteFileSync } from './remoteFileSync';
 import { RemoteInputError, type RemoteModelCatalog } from './remoteModelCatalog';
 import { RemoteReplyTransport } from './remoteReplyTransport';
+import { RemoteSyncStateError, retentionSequence } from './remoteRetention';
 import { type ProjectionRecord, RemoteStore, type SyncRow } from './remoteStore';
 import { REMOTE_SYNC_REQUEST_ID_HEADER, remoteSyncErrorMetadata, remoteSyncRequestId, remoteSyncRequestMetadata, remoteSyncResultMetadata } from './remoteSyncLog';
 
 export interface RemoteCommand {
   commandId: string; type: string; sessionId?: string; runId?: string; status: string; statusVersion: string;
-  expiresAt: string; request: any; requestHash: string; claimId?: string; claimToken?: string; claimUntil?: string;
+  detailState?: string; expiresAt: string; request: any; requestHash: string; claimId?: string; claimToken?: string; claimUntil?: string;
 }
 export interface InboxEntry {
   command: RemoteCommand; owner: RemoteOwner; localSessionId: string | null; remoteSessionId: string | null;
@@ -34,7 +36,7 @@ export interface InboxEntry {
 interface Registration { deviceId: string; userId: string; scopeKey: string; metadataVersion: string }
 interface LocalSettings { createSessionAvailable?: boolean; enabled: boolean; name: string; workspaces: Array<RemoteWorkspace & { path: string }>; settingsVersion: string }
 interface ControlIntent { createSessionAvailable?: boolean; id: string; enabled: boolean; workspaces: RemoteWorkspace[] }
-interface SavedImport { projectionVersion?: number; importId: string; sessionId: string; baseSourceSeq: string; snapshotEpoch: number; expectedSourceSeq: string; expectedServerSeq: string; beginConfirmed?: boolean; manifest: any; parts: any[]; stateVersion?: string }
+interface SavedImport extends RetentionImport { reason?: string; projectionVersion?: number; importId: string; sessionId: string; baseSourceSeq: string; snapshotEpoch: number; expectedSourceSeq: string; expectedServerSeq: string; beginConfirmed?: boolean; manifest: any; parts: any[]; stateVersion?: string }
 export interface BridgeDependencies {
   input?: { models: RemoteModelCatalog; preparations: InputPreparationService };
   files?: { cacheRoot: string; access(filePath: string): { assertAllowed(): void } };
@@ -119,6 +121,11 @@ export class RemoteBridge {
   private fileCapabilities: string[] = [];
   private projectionVersion = 1;
   private replySupported = false;
+  private retentionSupported = false;
+  private receiptsSupported = false;
+  private capabilitiesKnown = false;
+  private fenceCheckedAt = 0;
+  private readonly retentionVerifiedAt = new Map<string, number>();
   private readonly replies = new RemoteReplyTransport();
   private fileTimer: ReturnType<typeof setInterval> | null = null;
   constructor(private readonly deps: BridgeDependencies) {
@@ -260,7 +267,8 @@ export class RemoteBridge {
     this.connectionReason = RemoteConnectionReason.Connecting;
     this.deps.store.setEnabledOwner(null); this.disconnect();
     this.declaredDualApproval = false; this.deps.store.setApprovalProjectionSupported(false);
-    this.fileCapabilities = []; this.replySupported = false; this.replies.clear(); this.deps.store.setReplyProjectionSupported(false); this.projectionVersion = 1; this.files?.configure(false); this.deps.store.setFileProjectionSupported(false);
+    this.fileCapabilities = []; this.replySupported = false; this.replies.clear(); this.projectionVersion = 1; this.files?.configure(false);
+    this.retentionSupported = false; this.receiptsSupported = false; this.capabilitiesKnown = false; this.fenceCheckedAt = 0; this.retentionVerifiedAt.clear();
     this.deps.configureDualApproval?.({ enabled: false, projectionSupported: false });
     this.deps.onAccountChange(previous, current); this.changed();
   }
@@ -495,7 +503,7 @@ export class RemoteBridge {
   }
   private advertisedCapabilities(createSessionAvailable = true): string[] {
     const supported = this.declaredAgentCapabilities.includes(RemoteCapability.AgentSelection) || createSessionAvailable && this.settings().createSessionAvailable !== false ? capabilities : capabilities.filter(value => value !== RemoteCapability.CreateSession);
-    return [...(this.sameAccountAccess ? [...supported, RemoteCapability.SameAccountAccess] : supported), ...this.declaredAgentCapabilities, ...this.inputCapabilities, ...this.fileCapabilities, ...(this.replySupported ? [RemoteReplyCapability] : []), ...(this.declaredDualApproval ? [RemoteCapability.DualApproval] : [])];
+    return [...(this.sameAccountAccess ? [...supported, RemoteCapability.SameAccountAccess] : supported), ...this.declaredAgentCapabilities, ...this.inputCapabilities, ...this.fileCapabilities, ...(this.replySupported ? [RemoteReplyCapability] : []), ...(this.retentionSupported ? [RemoteRetention.Capability] : []), ...(this.receiptsSupported ? [RemoteRetention.Receipts] : []), ...(this.declaredDualApproval ? [RemoteCapability.DualApproval] : [])];
   }
   private async ensureRegistration(): Promise<void> {
     if (this.registration) return;
@@ -514,18 +522,21 @@ export class RemoteBridge {
       // Legacy servers still receive a saved disable; never announce an unsupported capability to them.
       if (!this.controls().some(intent => !intent.enabled)) throw new RemoteApiError(47000, 'Server upgrade required for same-account remote access');
     }
-    const previous = stableJson([this.declaredAgentCapabilities, this.declaredDualApproval, this.fileCapabilities, this.replySupported]);
+    const previous = stableJson([this.declaredAgentCapabilities, this.declaredDualApproval, this.fileCapabilities, this.replySupported, this.retentionSupported, this.receiptsSupported]);
     const previousProjectionVersion = this.projectionVersion;
     const supported = Array.isArray(support.capabilities) ? support.capabilities : [];
     this.inputCapabilities = this.deps.input ? Object.values(RemoteInputCapability).filter(value => supported.includes(value)) : [];
     this.fileCapabilities = this.files && support.projectionVersions?.includes(3) ? Object.values(RemoteFileCapability).filter(value => supported.includes(value)) : [];
     const fileSupported = this.fileCapabilities.length === Object.values(RemoteFileCapability).length;
     this.replySupported = support.projectionVersions?.includes(REMOTE_REPLY_PROJECTION_VERSION) === true && supported.includes(RemoteReplyCapability);
-    this.deps.store.setReplyProjectionSupported(this.replySupported);
+    this.retentionSupported = supported.includes(RemoteRetention.Capability) && support.syncRetention?.version === RemoteRetention.Version
+      && support.syncRetention.eventIdAlgorithm === RemoteRetention.EventIdAlgorithm;
+    this.receiptsSupported = supported.includes(RemoteRetention.Receipts);
+    this.capabilitiesKnown = true;
     this.projectionVersion = this.replySupported ? REMOTE_REPLY_PROJECTION_VERSION : fileSupported ? 3 : this.inputCapabilities.includes(RemoteInputCapability.Schema) ? 2 : 1;
-    this.files?.configure(fileSupported); this.deps.store.setFileProjectionSupported(fileSupported);
+    this.files?.configure(fileSupported);
     if (this.socket && previousProjectionVersion !== this.projectionVersion) this.disconnect();
-    this.deps.store.setInputProjectionSupported(fileSupported || this.deps.input !== undefined && supported.includes(RemoteInputCapability.Schema));
+
     this.agentCapabilities = this.agentCatalog && supported.includes(RemoteCapability.SessionAgent) ? [RemoteCapability.SessionAgent] : [];
     this.ownershipClaimCapability = { environment, owner: { ...this.owner! },
       enabled: this.agentCapabilities.includes(RemoteCapability.SessionAgent) && supported.includes(RemoteCapability.AgentOwnershipClaim) };
@@ -536,8 +547,7 @@ export class RemoteBridge {
       this.agentCapabilities.push(RemoteCapability.AgentCatalog);
       if (supported.includes(RemoteCapability.AgentSelection)) this.agentCapabilities.push(RemoteCapability.AgentSelection);
     }
-    this.deps.store.setAgentSummaryResolver(this.agentCapabilities.includes(RemoteCapability.SessionAgent)
-      ? (sessionId, actor) => this.agentCatalog!.summary(sessionId, actor) : null);
+
     // Admission flags may turn off while accepted extended commands still need recovery.
     // Device protocol support is persistent; only new production uses the current intersection.
     const declarationKey = `agentCapabilities:${this.owner!.userId}:${this.owner!.scopeKey}`;
@@ -554,7 +564,18 @@ export class RemoteBridge {
     this.deps.configureDualApproval?.({ enabled: dualEnabled, projectionSupported: this.declaredDualApproval });
     this.lastCapabilityCheck = Date.now();
     if (this.registration && this.settings().enabled) this.ownershipClaimBlocks();
-    if (this.registration && previous !== stableJson([this.declaredAgentCapabilities, this.declaredDualApproval, this.fileCapabilities, this.replySupported])) this.queueControl(this.settings());
+    if (this.registration) this.applyProjectionCapabilities();
+    if (this.registration && previous !== stableJson([this.declaredAgentCapabilities, this.declaredDualApproval, this.fileCapabilities, this.replySupported, this.retentionSupported, this.receiptsSupported])) this.queueControl(this.settings());
+  }
+  private applyProjectionCapabilities(): void {
+    if (!this.capabilitiesKnown || !this.owner || !this.registration) return;
+    this.deps.store.setProjectionIdentity(this.remoteEnvironment(), this.owner, this.registration.deviceId);
+    this.deps.store.setReplyProjectionSupported(this.replySupported);
+    const fileSupported = this.fileCapabilities.length === Object.values(RemoteFileCapability).length;
+    this.deps.store.setFileProjectionSupported(fileSupported);
+    this.deps.store.setInputProjectionSupported(fileSupported || this.inputCapabilities.includes(RemoteInputCapability.Schema));
+    this.deps.store.setAgentSummaryResolver(this.agentCapabilities.includes(RemoteCapability.SessionAgent)
+      ? (sessionId, actor) => this.agentCatalog!.summary(sessionId, actor) : null);
   }
   private async register(): Promise<void> {
     await this.refreshCapabilities();
@@ -563,6 +584,7 @@ export class RemoteBridge {
       kind: 'desktop', protocolVersion: REMOTE_PROTOCOL_VERSION, capabilities: this.advertisedCapabilities() }, false);
     if (!sameOwner(this.owner, result)) throw new Error('Registration owner does not match the authenticated account');
     this.registration = result;
+    this.applyProjectionCapabilities();
     if (this.sameAccountAccess) this.connectionReason = RemoteConnectionReason.Connecting;
     if (!this.controls().length) this.queueControl(this.settings());
     this.changed();
@@ -737,7 +759,7 @@ export class RemoteBridge {
       if (this.ownershipSyncBlocked(row.local_id)) { this.logSyncSkipped(row, 'ownership_admission_pending'); continue; }
       const failure = this.deps.store.get<any>(`syncFailure:${row.local_id}`);
       // Older builds kept failure markers after a successful snapshot ACK.
-      if (failure && row.device_id === deviceId && !row.needs_snapshot && row.source_seq === row.ack_seq
+      if (failure && !failure.blocked && row.device_id === deviceId && !row.needs_snapshot && row.source_seq === row.ack_seq
         && !this.deps.store.get(`import:${row.local_id}`)
         && !this.deps.store.db.prepare('SELECT session_id FROM remote_dirty WHERE session_id=?').get(row.local_id)
         && !this.deps.store.pending(row.local_id).length) {
@@ -746,25 +768,37 @@ export class RemoteBridge {
         console.debug('[RemoteSync] Stale failure marker cleared', { localSessionId: row.local_id, sessionId: row.session_id, ackSourceSeq: row.ack_seq, serverSeq: row.server_seq });
         continue;
       }
+      if (failure?.blocked) { this.logSyncSkipped(row, 'sync_state_blocked'); continue; }
       if (failure?.reason === 'REPLY_CONTENT_QUOTA_EXCEEDED') { this.logSyncSkipped(row, 'reply_quota_exceeded'); continue; }
       if (failure?.retryAt > Date.now()) { this.logSyncSkipped(row, 'retry_backoff', failure.retryAt); continue; }
       try {
       if (!this.generation && !row.device_id) { this.logSyncSkipped(row, 'awaiting_connection'); continue; }
       if (row.device_id && row.device_id !== this.registration.deviceId) { this.logSyncSkipped(row, 'device_mismatch'); continue; }
+      if (row.sync_environment && row.sync_environment !== environment) throw new RemoteSyncStateError('Session belongs to a different remote service');
       this.syncSkipReasons.delete(row.local_id);
       if (!row.device_id) this.deps.store.bindRemote(row.local_id, row.session_id, this.registration.deviceId);
+      if (row.sync_protocol_version === RemoteRetention.Version && !this.retentionSupported
+        && Date.now() - (this.retentionVerifiedAt.get(row.local_id) || 0) >= IDLE_POLL_MS) {
+        await this.readSyncState(row);
+        if (!current()) return;
+        this.retentionVerifiedAt.set(row.local_id, Date.now());
+      }
       const savedImport = this.deps.store.get<SavedImport>(`import:${row.local_id}`);
-      if (row.needs_snapshot || savedImport) { await this.importSession(this.deps.store.sync(row.local_id)!, savedImport); continue; }
+      if (row.needs_snapshot || savedImport || this.retentionSupported && row.sync_protocol_version < RemoteRetention.Version) { await this.importSession(this.deps.store.sync(row.local_id)!, savedImport); continue; }
       const events = this.deps.store.pending(row.local_id);
       if (!events.length) continue;
       await this.uploadReplyContents(row.local_id, row.session_id, events);
       if (!current()) return;
       const batchId = payloadHash(events);
       const result = await this.api('/sync/batches', 'POST', { batchId, deviceId: this.registration.deviceId,
-        ...this.transport(), owner: this.owner, sessionId: row.session_id, localSessionId: row.local_id, events });
+        ...this.transport(), ...(row.sync_protocol_version === RemoteRetention.Version ? { syncProtocolVersion: RemoteRetention.Version, streamEpoch: row.stream_epoch } : {}), owner: this.owner, sessionId: row.session_id, localSessionId: row.local_id, events });
       if (!current()) return;
       if (result.batchId !== batchId || result.deviceId !== this.registration.deviceId || result.sessionId !== row.session_id) throw new Error('Remote batch ACK identity mismatch');
-      this.deps.store.acknowledge(row.local_id, result.deviceId, result.sessionId, result.committedSourceSeq, result.committedSeq);
+      if (retentionSequence(result.committedSourceSeq) < retentionSequence(events.at(-1)!.sourceSeq)) throw new Error('Remote batch ACK did not cover the submitted events');
+      this.deps.store.transaction(() => {
+        if (row.sync_protocol_version === RemoteRetention.Version) this.deps.store.applyRetentionAck(row.local_id, result);
+        this.deps.store.acknowledge(row.local_id, result.deviceId, result.sessionId, result.committedSourceSeq, result.committedSeq);
+      });
       this.deps.store.remove(`syncFailure:${row.local_id}`);
       console.debug('[RemoteSync] Batch acknowledged locally', { localSessionId: row.local_id, ...remoteSyncResultMetadata(result),
         sourceSeq: this.deps.store.sync(row.local_id)?.source_seq ?? null, previousAckSourceSeq: row.ack_seq });
@@ -780,6 +814,17 @@ export class RemoteBridge {
           importId: this.deps.store.get<SavedImport>(`import:${row.local_id}`)?.importId ?? null, retryDelayMs: this.isGlobalError(error) ? null : 30000,
           phase: row.needs_snapshot || this.deps.store.get(`import:${row.local_id}`) ? 'snapshot' : 'batch', ...diagnostic });
         if (this.isGlobalError(error)) throw error;
+        if (error instanceof RemoteApiError && error.code === 47025 && error.data?.currentImport) {
+          await this.recoverImportConflict(row, error.data.currentImport, current);
+        }
+        if (error instanceof RemoteApiError && (error.code === RemoteRetention.ResyncCode
+          || error.code === RemoteRetention.ProtocolCode && error.data?.reasonDetail === 'SYNC_RETENTION_REQUIRED')) {
+          try { await this.recoverSyncState(row, current); } catch (recoveryError) {
+            if (!(recoveryError instanceof RemoteSyncStateError)) throw recoveryError;
+            this.deps.store.put(`syncFailure:${row.local_id}`, { ...diagnostic, blocked: true, reason: RemoteRetention.StateConflict });
+            this.error = SESSION_SYNC_ERROR_MESSAGE; continue;
+          }
+        }
         if (error instanceof RemoteApiError && error.code === 47006 && error.message === RemoteSyncConflict.RunMapping
           && !row.needs_snapshot && !this.deps.store.get(`import:${row.local_id}`)) {
           this.deps.store.requireRunMappingSnapshot(row.local_id);
@@ -787,10 +832,11 @@ export class RemoteBridge {
             controlVersion: this.deps.store.controlVersion(row.local_id), ackSourceSeq: row.ack_seq,
             sourceSeq: this.deps.store.sync(row.local_id)?.source_seq ?? null });
         }
-        this.deps.store.put(`syncFailure:${row.local_id}`, { ...diagnostic, retryAt: Date.now() + 30000 });
+        this.deps.store.put(`syncFailure:${row.local_id}`, { ...diagnostic, ...(error instanceof RemoteSyncStateError ? { blocked: true, reason: RemoteRetention.StateConflict } : {}), retryAt: Date.now() + 30000 });
         this.error = SESSION_SYNC_ERROR_MESSAGE;
       }
     }
+    await this.ensureRetentionFence();
     if (this.error === SESSION_SYNC_ERROR_MESSAGE && !this.deps.store.sessions(owner).some(row => this.deps.store.get(`syncFailure:${row.local_id}`))) {
       this.error = undefined;
     }
@@ -837,78 +883,168 @@ export class RemoteBridge {
       api: (pathname, method, body) => this.api(pathname, method, body),
     });
   }
+  private importProtocol(saved: SavedImport): Record<string, unknown> {
+    if (saved.syncProtocolVersion !== RemoteRetention.Version) return {};
+    if (!saved.targetStreamEpoch) throw new RemoteSyncStateError('Pending import epoch has not been persisted');
+    return { syncProtocolVersion: RemoteRetention.Version, streamEpoch: saved.targetStreamEpoch };
+  }
+  private completeImport(row: SyncRow, saved: SavedImport, result: any): void {
+    this.deps.store.transaction(() => {
+      if (saved.syncProtocolVersion === RemoteRetention.Version) {
+        const epoch = result.targetStreamEpoch || result.streamEpoch;
+        if (result.state !== 'committed' || result.sessionId !== saved.sessionId || result.importId !== saved.importId
+          || result.manifestHash !== saved.manifest.manifestHash || result.syncProtocolVersion !== RemoteRetention.Version
+          || epoch !== saved.targetStreamEpoch || result.streamEpoch !== epoch
+          || result.committedSourceSeq !== saved.baseSourceSeq) throw new RemoteSyncStateError('Remote import receipt identity mismatch');
+        this.deps.store.applyRetentionAck(row.local_id, result, true);
+      }
+      this.deps.store.acknowledge(row.local_id, this.registration!.deviceId, saved.sessionId,
+        result.committedSourceSeq, result.committedSeq, true, saved.snapshotEpoch);
+      this.deps.store.remove(`import:${row.local_id}`);
+      this.deps.store.remove(`syncFailure:${row.local_id}`);
+      this.deps.store.unfreezeMigration(row.local_id);
+    });
+  }
+  private discardImport(row: SyncRow): void {
+    this.deps.store.transaction(() => {
+      this.deps.store.remove(`import:${row.local_id}`);
+      this.deps.store.requireSnapshot(row.local_id);
+      this.deps.store.unfreezeMigration(row.local_id);
+    });
+  }
+  private async recoverImportConflict(row: SyncRow, remote: any, current: () => boolean): Promise<void> {
+    const pending = this.deps.store.get<SavedImport>(`import:${row.local_id}`);
+    if (!pending?.beginConfirmed || remote.importId !== pending.importId || !current()) return;
+    if (remote.state === 'committed') { this.completeImport(row, pending, remote); return; }
+    if (remote.state !== 'uploading') {
+      if (['aborted', 'expired'].includes(remote.state)) this.discardImport(row);
+      return;
+    }
+    // A changed server baseline invalidates the immutable package, not its local history.
+    // Only a confirmed abort permits rebuilding; uncertain/committed outcomes retain the original receipt.
+    const aborted = await this.api(`/sync/imports/${pending.importId}/abort`, 'POST', {
+      ...this.transport(), ...this.importProtocol(pending), expectedStateVersion: remote.stateVersion, reason: 'baseline_changed',
+    });
+    if (!current()) return;
+    if (aborted.state === 'committed') this.completeImport(row, pending, aborted);
+    else if (['aborted', 'expired'].includes(aborted.state)) this.discardImport(row);
+  }
+  private async readSyncState(row: SyncRow): Promise<RetentionState | null> {
+    try {
+      const state: RetentionState = await this.api(`/sync/state?localSessionId=${encodeURIComponent(row.local_id)}`);
+      if (state.deviceId !== this.registration!.deviceId || state.sessionId !== row.session_id || state.localSessionId !== row.local_id
+        || retentionSequence(state.lastSourceSeq) > BigInt(this.deps.store.sync(row.local_id)!.source_seq)
+        || retentionSequence(state.lastSourceSeq) < BigInt(row.ack_seq)
+        || retentionSequence(state.lastSeq) < retentionSequence(row.server_seq)
+        || (row.stream_epoch && row.stream_epoch !== state.streamEpoch)) throw new RemoteSyncStateError('Remote sync state conflicts with durable local history');
+      if (row.sync_protocol_version === RemoteRetention.Version && state.syncProtocolVersion !== RemoteRetention.Version) throw new RemoteSyncStateError('Server cannot restore the active synchronization protocol');
+      return state;
+    } catch (error) {
+      // Only a never-published session may be created after a verified missing mapping.
+      if (error instanceof RemoteApiError && error.httpStatus === 404 && error.code === RemoteRetention.StateMissingCode && row.ack_seq === 0 && row.sync_protocol_version === 1) return null;
+      if (row.sync_protocol_version === RemoteRetention.Version && error instanceof RemoteApiError && [404, 426].includes(error.httpStatus)) throw new RemoteSyncStateError('Server no longer supports this active synchronization protocol');
+      throw error;
+    }
+  }
+  private async recoverSyncState(row: SyncRow, current: () => boolean): Promise<void> {
+    // An in-flight import is the recovery authority; never manufacture an ACK from GET state.
+    const pending = this.deps.store.get<SavedImport>(`import:${row.local_id}`);
+    if (pending) {
+      const status = await this.api(`/sync/imports/${pending.importId}`);
+      if (!current()) return;
+      if (status.state === 'committed') {
+        if (status.targetStreamEpoch) pending.targetStreamEpoch ||= status.targetStreamEpoch;
+        this.completeImport(row, pending, status); return;
+      }
+      throw new RemoteSyncStateError('Pending import must be reconciled before changing the synchronization stream');
+    }
+    const state = await this.readSyncState(row);
+    if (!current()) return;
+    if (!state || state.activeImport || state.syncProtocolVersion !== row.sync_protocol_version || state.streamEpoch !== row.stream_epoch) throw new RemoteSyncStateError('Remote stream recovery needs its original import receipt');
+    this.deps.store.requireSnapshot(row.local_id);
+  }
   private async importSession(row: SyncRow, saved: SavedImport | null): Promise<void> {
     if (this.ownershipSyncBlocked(row.local_id)) return;
     const key = `import:${row.local_id}`;
     const current = this.syncContext();
     const assertCurrent = (): void => { if (!current()) throw new Error('Reply synchronization context changed'); };
     assertCurrent();
+    if (saved && (saved.owner && !sameOwner(saved.owner, this.owner) || saved.environment && saved.environment !== this.remoteEnvironment()
+      || saved.deviceId && saved.deviceId !== this.registration!.deviceId)) throw new RemoteSyncStateError('Saved import belongs to a different synchronization identity');
     const importHasReplies = saved?.projectionVersion === REMOTE_REPLY_PROJECTION_VERSION
       || saved?.parts.some(part => part.payload.records.some((record: ProjectionRecord) => record.payload.message?.projectionVersion === REMOTE_REPLY_PROJECTION_VERSION));
-    if (saved && Boolean(importHasReplies) !== this.replySupported) {
+    const projectionChanged = saved?.projectionVersion !== undefined ? saved.projectionVersion !== this.projectionVersion : Boolean(importHasReplies) !== this.replySupported;
+    const deleted = this.deps.store.db.prepare('SELECT id FROM cowork_sessions WHERE id=?').get(row.local_id) === undefined;
+    if (saved && (projectionChanged || deleted && !saved.manifest.recordCounts['session.deleted'])) {
       try {
         const old = await this.api(`/sync/imports/${saved.importId}`);
         assertCurrent();
-        if (old.state === 'committed') this.deps.store.acknowledge(row.local_id, this.registration!.deviceId, saved.sessionId,
-          old.committedSourceSeq, old.committedSeq, true, saved.snapshotEpoch);
-        else if (old.state === 'uploading') await this.api(`/sync/imports/${saved.importId}/abort`, 'POST', {
-          ...this.transport(), expectedStateVersion: old.stateVersion, reason: 'projection_changed',
-        });
+        if (old.state === 'committed') {
+          if (old.targetStreamEpoch) saved.targetStreamEpoch ||= old.targetStreamEpoch;
+          this.completeImport(row, saved, old);
+          this.deps.store.requireSnapshot(row.local_id);
+          return;
+        }
+        if (old.state === 'uploading') {
+          if (old.targetStreamEpoch) saved.targetStreamEpoch ||= old.targetStreamEpoch;
+          this.deps.store.put(key, saved);
+          const aborted = await this.api(`/sync/imports/${saved.importId}/abort`, 'POST', { ...this.transport(), ...this.importProtocol(saved),
+            expectedStateVersion: old.stateVersion, reason: deleted ? 'session_deleted' : 'projection_changed' });
+          assertCurrent();
+          if (aborted.state === 'committed') { this.completeImport(row, saved, aborted); this.deps.store.requireSnapshot(row.local_id); return; }
+          if (saved.syncProtocolVersion === RemoteRetention.Version && !['aborted', 'expired'].includes(aborted.state)) throw new RemoteSyncStateError('Import abortion is not confirmed');
+        } else if (!['aborted', 'expired'].includes(old.state)) throw new RemoteSyncStateError('Unknown remote import state');
       } catch (error) { if (!(error instanceof RemoteApiError) || error.httpStatus !== 404 || saved.beginConfirmed) throw error; }
       assertCurrent();
-      this.deps.store.remove(key); this.deps.store.requireSnapshot(row.local_id); return;
-    }
-    const deleted = this.deps.store.db.prepare('SELECT id FROM cowork_sessions WHERE id=?').get(row.local_id) === undefined;
-    if (deleted && saved && !saved.manifest.recordCounts['session.deleted']) {
-      try {
-        const previous = await this.api(`/sync/imports/${saved.importId}`);
-        assertCurrent();
-        if (this.ownershipSyncBlocked(row.local_id)) return;
-        if (previous.state === 'committed') this.deps.store.acknowledge(row.local_id, this.registration!.deviceId, saved.sessionId, previous.committedSourceSeq, previous.committedSeq, true, saved.snapshotEpoch);
-        else if (previous.state === 'uploading') await this.api(`/sync/imports/${saved.importId}/abort`, 'POST', { ...this.transport(), expectedStateVersion: previous.stateVersion, reason: 'session_deleted' });
-      } catch (error) { if (!(error instanceof RemoteApiError) || error.httpStatus !== 404 || saved.beginConfirmed) throw error; }
-      assertCurrent();
-      this.deps.store.remove(key); this.deps.store.requireSnapshot(row.local_id); saved = null; row = this.deps.store.sync(row.local_id)!;
+      this.discardImport(row); return;
     }
     if (!saved) {
-      const snapshot = this.deps.store.snapshot(row.local_id);
-      const groups: ProjectionRecord[][] = [[]];
-      for (const record of snapshot.records) {
-        const group = groups[groups.length - 1];
-        if (group.length && Buffer.byteLength(stableJson({ records: [...group, record] })) > 600 * 1024) groups.push([record]);
-        else group.push(record);
-      }
-      const parts = groups.map((records, partNo) => {
-        const payload = { records };
-        return { partNo, payload, payloadHash: payloadHash(payload), byteSize: Buffer.byteLength(stableJson(payload)) };
+      const useV2 = this.retentionSupported || row.sync_protocol_version === RemoteRetention.Version;
+      const state = useV2 ? await this.readSyncState(row) : null;
+      assertCurrent();
+      if (state?.activeImport) throw new RemoteSyncStateError('Remote active import is missing from local durable state');
+      if (state && state.syncProtocolVersion !== row.sync_protocol_version) throw new RemoteSyncStateError('Remote protocol has no matching local activation receipt');
+      const migration = useV2 && row.sync_protocol_version < RemoteRetention.Version;
+      saved = this.deps.store.transaction(() => {
+        const snapshot = this.deps.store.snapshot(row.local_id);
+        const groups: ProjectionRecord[][] = [[]];
+        for (const record of snapshot.records) {
+          const group = groups[groups.length - 1];
+          if (group.length && Buffer.byteLength(stableJson({ records: [...group, record] })) > 600 * 1024) groups.push([record]);
+          else group.push(record);
+        }
+        const parts = groups.map((records, partNo) => {
+          const payload = { records };
+          return { partNo, payload, payloadHash: payloadHash(payload), byteSize: Buffer.byteLength(stableJson(payload)) };
+        });
+        const recordCounts: Record<string, number> = {};
+        for (const record of snapshot.records) recordCounts[record.eventType] = (recordCounts[record.eventType] || 0) + 1;
+        const prepared: SavedImport = { reason: migration ? 'protocol_upgrade' : this.deps.store.get<string>(`snapshotReason:${row.local_id}`) || 'initial_sync', projectionVersion: this.projectionVersion, importId: randomUUID(), sessionId: row.session_id,
+          baseSourceSeq: snapshot.baseSourceSeq, snapshotEpoch: snapshot.snapshotEpoch,
+          expectedSourceSeq: state?.lastSourceSeq || String(row.ack_seq), expectedServerSeq: state?.lastSeq || row.server_seq, parts,
+          owner: { ...this.owner! }, environment: this.remoteEnvironment(), deviceId: this.registration!.deviceId,
+          ...(useV2 ? { syncProtocolVersion: RemoteRetention.Version, expectedStreamEpoch: row.stream_epoch, migration } : {}),
+          manifest: { partCount: parts.length, recordCounts, manifestHash: payloadHash(parts.map(({ partNo, payloadHash: hash, byteSize }) => ({ partNo, payloadHash: hash, byteSize }))) } };
+        this.deps.store.put(key, prepared);
+        if (migration) this.deps.store.freezeMigration(row.local_id);
+        return prepared;
       });
-      const recordCounts: Record<string, number> = {};
-      for (const record of snapshot.records) recordCounts[record.eventType] = (recordCounts[record.eventType] || 0) + 1;
-      saved = { projectionVersion: this.projectionVersion, importId: randomUUID(), sessionId: row.session_id, baseSourceSeq: snapshot.baseSourceSeq, snapshotEpoch: snapshot.snapshotEpoch, expectedSourceSeq: String(row.ack_seq), expectedServerSeq: row.server_seq, parts,
-        manifest: { partCount: parts.length, recordCounts, manifestHash: payloadHash(parts.map(({ partNo, payloadHash: hash, byteSize }) => ({ partNo, payloadHash: hash, byteSize }))) } };
-      this.deps.store.put(key, saved);
     }
-    console.debug('[RemoteSync] Snapshot prepared', { localSessionId: row.local_id, sessionId: saved.sessionId, importId: saved.importId,
-      baseSourceSeq: saved.baseSourceSeq, expectedSourceSeq: saved.expectedSourceSeq, expectedServerSeq: saved.expectedServerSeq,
-      snapshotEpoch: saved.snapshotEpoch, resuming: saved.beginConfirmed === true, partCount: saved.parts.length,
-      totalBytes: saved.parts.reduce((sum, part) => sum + part.byteSize, 0) });
     let begun: any;
     try {
       begun = await this.api('/sync/imports', 'POST', { importId: saved.importId, deviceId: this.registration!.deviceId,
         owner: this.owner, localSessionId: row.local_id, sessionId: saved.sessionId, baseSourceSeq: saved.baseSourceSeq,
-        expectedSourceSeq: saved.expectedSourceSeq, expectedServerSeq: saved.expectedServerSeq, manifest: saved.manifest, ...this.transport() });
+        expectedSourceSeq: saved.expectedSourceSeq, expectedServerSeq: saved.expectedServerSeq, manifest: saved.manifest,
+        ...(saved.syncProtocolVersion === RemoteRetention.Version ? { syncProtocolVersion: RemoteRetention.Version, expectedStreamEpoch: saved.expectedStreamEpoch } : {}), ...this.transport() });
     } catch (error) {
       assertCurrent();
       if (error instanceof RemoteApiError && error.code === 47025 && !saved.beginConfirmed
         && !error.data?.currentImport && !error.data?.activeImportId && typeof error.data?.currentSourceSeq === 'string' && /^\d+$/.test(error.data.currentSourceSeq)
         && typeof error.data?.currentServerSeq === 'string' && /^\d+$/.test(error.data.currentServerSeq)) {
-        const source = BigInt(error.data.currentSourceSeq); const server = BigInt(error.data.currentServerSeq);
+        const source = retentionSequence(error.data.currentSourceSeq), server = retentionSequence(error.data.currentServerSeq);
         if (source >= BigInt(saved.expectedSourceSeq) && source <= BigInt(saved.baseSourceSeq)
           && source <= BigInt(this.deps.store.sync(row.local_id)!.source_seq) && server >= BigInt(saved.expectedServerSeq)) {
-          // The server proves no import was allocated. Rebase only the unsent snapshot expectation;
-          // outbox and acknowledged positions stay untouched until the actual import commits.
-          console.debug('[RemoteSync] Snapshot baseline rebased', { localSessionId: row.local_id, sessionId: saved.sessionId, importId: saved.importId,
-            previousSourceSeq: saved.expectedSourceSeq, previousServerSeq: saved.expectedServerSeq, currentSourceSeq: source.toString(), currentServerSeq: server.toString() });
+          // Rebase only a proven unallocated request. No durable source ACK is advanced.
           saved.expectedSourceSeq = source.toString(); saved.expectedServerSeq = server.toString();
           this.deps.store.put(key, saved); return;
         }
@@ -916,35 +1052,72 @@ export class RemoteBridge {
       throw error;
     }
     assertCurrent();
-    saved.beginConfirmed = true; this.deps.store.put(key, saved);
-    if (begun.state === 'aborted' || begun.state === 'expired') {
-      console.debug('[RemoteSync] Snapshot will be rebuilt', { localSessionId: row.local_id, importId: saved.importId, state: begun.state });
-      this.deps.store.remove(key); this.deps.store.requireSnapshot(row.local_id); return;
+    if (begun.sessionId !== saved.sessionId) throw new RemoteSyncStateError('Import changed the fixed remote session mapping');
+    if (saved.syncProtocolVersion === RemoteRetention.Version) {
+      if (begun.syncProtocolVersion !== RemoteRetention.Version || begun.importId !== saved.importId
+        || begun.manifestHash !== saved.manifest.manifestHash || !begun.targetStreamEpoch
+        || saved.targetStreamEpoch && saved.targetStreamEpoch !== begun.targetStreamEpoch
+        || saved.expectedStreamEpoch && saved.expectedStreamEpoch !== begun.targetStreamEpoch) throw new RemoteSyncStateError('Import changed its reserved synchronization epoch');
+      saved.targetStreamEpoch = begun.targetStreamEpoch;
     }
-    if (begun.sessionId !== saved.sessionId) throw new Error('Import changed the fixed remote session mapping');
+    saved.beginConfirmed = true; this.deps.store.put(key, saved);
+    if (begun.state === 'aborted' || begun.state === 'expired') { this.discardImport(row); return; }
     let result = begun;
     if (begun.state !== 'committed') {
+      if (begun.partsExpired) throw new RemoteSyncStateError('Uploading import lost its durable parts');
       await this.uploadReplyContents(row.local_id, saved.sessionId, saved.parts.flatMap(part => part.payload.records));
       assertCurrent();
       for (const part of saved.parts) {
         if (this.ownershipSyncBlocked(row.local_id)) return;
-        await this.api(`/sync/imports/${saved.importId}/parts/${part.partNo}`, 'PUT', {
-          ...this.transport(), payloadHash: part.payloadHash, payload: part.payload });
+        try {
+          await this.api(`/sync/imports/${saved.importId}/parts/${part.partNo}`, 'PUT', {
+            ...this.transport(), ...this.importProtocol(saved), payloadHash: part.payloadHash, payload: part.payload });
+        } catch (error) {
+          if (!(error instanceof RemoteApiError) || error.code !== 47025 || error.data?.reasonDetail !== 'IMPORT_PARTS_EXPIRED') throw error;
+          const status = await this.api(`/sync/imports/${saved.importId}`);
+          assertCurrent();
+          if (status.state === 'committed') { this.completeImport(row, saved, status); return; }
+          if (['aborted', 'expired'].includes(status.state)) { this.discardImport(row); return; }
+          throw new RemoteSyncStateError('Import parts expired without a terminal receipt');
+        }
         assertCurrent();
       }
       if (this.ownershipSyncBlocked(row.local_id)) return;
-      result = await this.api(`/sync/imports/${saved.importId}/commit`, 'POST', { ...this.transport(), expectedStateVersion: begun.stateVersion, manifestHash: saved.manifest.manifestHash });
+      result = await this.api(`/sync/imports/${saved.importId}/commit`, 'POST', { ...this.transport(), ...this.importProtocol(saved),
+        expectedStateVersion: begun.stateVersion, manifestHash: saved.manifest.manifestHash });
     }
     assertCurrent();
-    this.deps.store.transaction(() => {
-      this.deps.store.acknowledge(row.local_id, this.registration!.deviceId, saved!.sessionId, result.committedSourceSeq, result.committedSeq, true, saved!.snapshotEpoch);
-      this.deps.store.remove(key);
-      this.deps.store.remove(`syncFailure:${row.local_id}`);
-    });
+    this.completeImport(row, saved, result);
     console.debug('[RemoteSync] Snapshot acknowledged locally', { localSessionId: row.local_id, importId: saved.importId, ...remoteSyncResultMetadata(result),
       sourceSeq: this.deps.store.sync(row.local_id)?.source_seq ?? null, needsSnapshot: Boolean(this.deps.store.sync(row.local_id)?.needs_snapshot) });
   }
+  private async ensureRetentionFence(): Promise<void> {
+    if (!this.owner || !this.registration || !this.retentionSupported || Date.now() - this.fenceCheckedAt < IDLE_POLL_MS) return;
+    const rows = this.deps.store.sessions(this.owner);
+    if (rows.some(row => row.sync_protocol_version !== RemoteRetention.Version || row.migration_frozen || this.deps.store.get(`import:${row.local_id}`))) return;
+    const current = this.syncContext();
+    const path = `/devices/${this.registration.deviceId}/sync-retention/fence`;
+    const key = `retentionFence:${JSON.stringify([this.remoteEnvironment(), this.owner.userId, this.owner.scopeKey, this.registration.deviceId])}`;
+    this.fenceCheckedAt = Date.now();
+    try {
+      const state = await this.api(path);
+      if (!current()) return;
+      if (state.minSyncProtocolVersion >= RemoteRetention.Version) { this.deps.store.remove(key); return; }
+      // The server must also verify sessions unavailable in this local database.
+      if (state.blockers?.length) return;
+      const request = this.deps.store.get<any>(key) || { requestId: randomUUID(), expectedFenceVersion: state.syncProtocolFenceVersion, minSyncProtocolVersion: RemoteRetention.Version };
+      this.deps.store.put(key, request);
+      const result = await this.api(path, 'POST', { ...request, ...this.transport() });
+      if (!current()) return;
+      if (result.deviceId !== this.registration.deviceId || result.minSyncProtocolVersion !== RemoteRetention.Version) throw new RemoteSyncStateError('Invalid device protocol fence receipt');
+      this.deps.store.remove(key);
+    } catch (error) {
+      if (!(error instanceof RemoteApiError) || ![409, 426].includes(error.httpStatus)) throw error;
+      // Keep stable requestId across generation changes; blocked devices continue using per-session v2.
+    }
+  }
   private isGlobalError(error: unknown): boolean {
+    if (error instanceof RemoteSyncStateError) return false;
     return !(error instanceof RemoteApiError) || [401, 403, 47000, 47013, 47023].includes(error.code) || error.code >= 500 && error.code < 600;
   }
   private async reportCommandError(entry: InboxEntry, error: unknown): Promise<void> {
@@ -1117,6 +1290,17 @@ export class RemoteBridge {
       for (const envelope of result.items || []) {
         const command: RemoteCommand = { ...envelope.command, ...envelope };
         delete (command as any).command;
+        if (command.detailState === RemoteRetention.Compacted) {
+          if (!['applied', 'rejected', 'expired'].includes(command.status)) throw new Error('A nonterminal command cannot be compacted');
+          const retained = this.deps.store.get<InboxEntry>(`inbox:${command.commandId}`);
+          if (retained && sameOwner(retained.owner, this.owner)) {
+            retained.command = { ...retained.command, ...command };
+            retained.state = command.status === 'applied' ? 'applied' : 'rejected';
+            retained.result = envelope.result || envelope.error || retained.result;
+            this.deps.store.put(`inbox:${command.commandId}`, retained);
+          }
+          continue;
+        }
         let entry = this.deps.store.get<InboxEntry>(`inbox:${command.commandId}`);
         if (entry && !sameOwner(entry.owner, this.owner)) continue;
         if (!entry && command.type !== 'approval_response' && envelope.currentClaimId && this.deps.store.hasCompleteExecutionHistory()

@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { app, BrowserWindow } from 'electron';
 import path from 'path';
 
-import { ASK_USER_QUESTION_TOOL_NAME, SESSION_AGNOSTIC_PERMISSION_SESSION_ID } from '../../shared/cowork/constants';
+import { ASK_USER_QUESTION_TOOL_NAME, CoworkIpcChannel, SESSION_AGNOSTIC_PERMISSION_SESSION_ID } from '../../shared/cowork/constants';
 import { McpIpcChannel } from '../../shared/mcp/constants';
 import { isComputerUseKitInstalled } from '../computerUse/computerUseKit';
 import { resolveComputerUseMcpServer } from '../computerUse/computerUseMcpServer';
@@ -29,6 +29,8 @@ import { McpStore } from './mcpStore';
 export type { AskUserResponse, MediaGenerationRequest, MediaGenerationResponse };
 
 export interface McpRuntimeDeps {
+  /** Shared with the IPC ownership check; only live question IDs are registered here. */
+  permissionSessions: Map<string, string>;
   getStore: () => SqliteStore;
   syncOpenClawConfig: (options: {
     reason: string;
@@ -149,11 +151,12 @@ export class McpRuntime {
         this.resolveAskUser(request.requestId, { behavior: 'deny' });
         return;
       }
+      this.deps.permissionSessions.set(request.requestId, sessionId);
       const windows = BrowserWindow.getAllWindows();
       windows.forEach(win => {
         if (win.isDestroyed()) return;
         try {
-          win.webContents.send('cowork:stream:permission', {
+          win.webContents.send(CoworkIpcChannel.StreamPermission, {
             sessionId,
             request: {
               requestId: request.requestId,
@@ -175,11 +178,12 @@ export class McpRuntime {
     });
 
     this.bridgeServer.onAskUserDismiss(requestId => {
+      this.deps.permissionSessions.delete(requestId);
       const windows = BrowserWindow.getAllWindows();
       windows.forEach(win => {
         if (win.isDestroyed()) return;
         try {
-          win.webContents.send('cowork:stream:permissionDismiss', { requestId });
+          win.webContents.send(CoworkIpcChannel.StreamPermissionDismiss, { requestId });
         } catch {
           // ignore
         }
@@ -211,8 +215,8 @@ export class McpRuntime {
     return await this.bridgeServer.askUserInternal(questions, timeoutMs, options);
   }
 
-  resolveAskUser(requestId: string, response: AskUserResponse): void {
-    this.bridgeServer?.resolveAskUser(requestId, response);
+  resolveAskUser(requestId: string, response: AskUserResponse): boolean {
+    return this.bridgeServer?.resolveAskUser(requestId, response) ?? false;
   }
 
   broadcastServersChanged(): void {

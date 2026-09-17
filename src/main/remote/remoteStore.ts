@@ -4,9 +4,11 @@ import { createHash, randomUUID } from 'crypto';
 import { OWNERSHIP_MANUAL_SOURCE } from '../../shared/ownership/constants';
 import { REMOTE_MESSAGE_BYTES, type RemoteAgentSummary, type RemoteOwner, type RemoteRunStatusValue } from '../../shared/remote/constants';
 import { RemoteReply, RemoteReplyBlockType, type RemoteReplyContentRef, type RemoteReplyFormat, type RemoteReplyUpload } from '../../shared/remote/reply';
+import { RemoteRetention } from '../../shared/remote/retention';
 import { payloadHash, remoteError, sameOwner, stableJson } from './canonical';
 import type { DesktopInputRun } from './desktopInputMetadata';
 import { isPublicReplyMessage, redactReplyText,replyAppendDelta, replyBlockId, replyBlocks, replyChunks, replyToolState } from './remoteReplyProjection';
+import { RemoteSyncStateError, retentionEventId, retentionSequence, safeSourceSequence } from './remoteRetention';
 import { remoteSyncErrorMetadata } from './remoteSyncLog';
 
 export interface ProjectionRecord { eventType: string; payload: Record<string, any> }
@@ -14,6 +16,7 @@ export interface RemoteEvent extends ProjectionRecord { eventId: string; sourceS
 export interface SyncRow {
   local_id: string; session_id: string; device_id: string; source_seq: number; ack_seq: number;
   server_seq: string; needs_snapshot: number;
+  sync_environment: string | null; sync_protocol_version: number; stream_epoch: string | null; source_purge_seq: string; event_purge_seq: string; migration_frozen: number;
 }
 export interface RemoteRun {
   runId: string; status: RemoteRunStatusValue; statusVersion: string;
@@ -43,6 +46,7 @@ export class RemoteStore {
   private inputProjectionSupported = false;
   private fileProjectionSupported = false;
   private replyProjectionSupported = false;
+  private projectionIdentity: { key: string; environment: string; owner: RemoteOwner; deviceId: string } | null = null;
   private fileEnvironment: string | null = null;
   private fileTerminalBoundary: ((sessionId: string, runId: string) => void) | null = null;
   private artifactProjection: ((sessionId: string, messageId: string) => Array<{ localArtifactId: string; block: Record<string, unknown> }>) | null = null;
@@ -82,6 +86,12 @@ export class RemoteStore {
       CREATE TABLE IF NOT EXISTS remote_reply_chunks(session_id TEXT NOT NULL, sha256 TEXT NOT NULL, content TEXT NOT NULL, size_bytes INTEGER NOT NULL, PRIMARY KEY(session_id,sha256));
       CREATE TABLE IF NOT EXISTS remote_source_owner (source_id TEXT PRIMARY KEY, owner_json TEXT NOT NULL);
     `);
+    const syncColumns = new Set((db.prepare('PRAGMA table_info(remote_sync)').all() as Array<{ name: string }>).map(column => column.name));
+    for (const [name, declaration] of Object.entries({ sync_environment: 'TEXT', sync_protocol_version: 'INTEGER NOT NULL DEFAULT 1', stream_epoch: 'TEXT',
+      source_purge_seq: "TEXT NOT NULL DEFAULT '0'", event_purge_seq: "TEXT NOT NULL DEFAULT '0'", migration_frozen: 'INTEGER NOT NULL DEFAULT 0' })) {
+      if (!syncColumns.has(name)) db.exec(`ALTER TABLE remote_sync ADD COLUMN ${name} ${declaration}`);
+    }
+    this.replyProjectionSupported = this.get<boolean>('replyProjectionMode') === true;
     for (const table of ['cowork_sessions', 'cowork_messages']) {
       const sid = table === 'cowork_sessions' ? 'id' : 'session_id';
       for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
@@ -132,19 +142,37 @@ export class RemoteStore {
     this.db.prepare('INSERT OR IGNORE INTO remote_content_dirty VALUES (?)').run(sessionId);
     this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(sessionId);
   }
+  /** Called only after negotiation and registration confirm the exact projection identity. */
+  setProjectionIdentity(environment: string, owner: RemoteOwner, deviceId: string): void {
+    const key = `projectionMode:${JSON.stringify([environment, owner.userId, owner.scopeKey, deviceId])}`;
+    if (this.projectionIdentity?.key === key) return;
+    this.projectionIdentity = { key, environment, owner: { ...owner }, deviceId };
+    this.db.prepare(`UPDATE remote_sync SET sync_environment=? WHERE sync_environment IS NULL AND (device_id='' OR device_id=?)
+      AND local_id IN (SELECT session_id FROM cowork_session_ownership WHERE owner_user_id=? AND owner_scope_key=?)`).run(environment, deviceId, owner.userId, owner.scopeKey);
+    this.replyProjectionSupported = this.get<boolean>(key) ?? this.get<boolean>('replyProjectionMode') ?? false;
+  }
+  private projectionSessions(): Array<{ session_id: string }> {
+    const owner = this.projectionIdentity?.owner || this.enabledOwner;
+    if (!owner) return [];
+    return this.db.prepare(`SELECT o.session_id FROM cowork_session_ownership o JOIN remote_sync s ON s.local_id=o.session_id
+      WHERE o.ownership_status='confirmed' AND o.owner_user_id=? AND o.owner_scope_key=?
+      AND (?='' OR s.device_id='' OR s.device_id=?) AND (? IS NULL OR s.sync_environment IS NULL OR s.sync_environment=?)`).all(owner.userId, owner.scopeKey,
+      this.projectionIdentity?.deviceId || '', this.projectionIdentity?.deviceId || '', this.projectionIdentity?.environment || null, this.projectionIdentity?.environment || null) as Array<{ session_id: string }>;
+  }
   setFileProjectionSupported(supported: boolean): void {
     if (supported === this.fileProjectionSupported) return;
     this.fileProjectionSupported = supported;
-    for (const { session_id } of this.db.prepare("SELECT session_id FROM cowork_session_ownership WHERE ownership_status='confirmed'").all() as Array<{ session_id: string }>) this.markFilesDirty(session_id);
+    for (const { session_id } of this.projectionSessions()) this.markFilesDirty(session_id);
   }
   /** Changing the wire projection requires an atomic snapshot, never mixed-version replay. */
   setReplyProjectionSupported(supported: boolean): void {
-    if (supported === this.replyProjectionSupported && (this.get<boolean>('replyProjectionMode') || false) === supported) return;
+    const modeKey = this.projectionIdentity?.key || 'replyProjectionMode';
+    if (supported === this.replyProjectionSupported) { this.put(modeKey, supported); return; }
     this.replyProjectionSupported = supported;
     this.transaction(() => {
-      this.put('replyProjectionMode', supported);
-      for (const { session_id } of this.db.prepare("SELECT session_id FROM cowork_session_ownership WHERE ownership_status='confirmed'").all() as Array<{ session_id: string }>) {
-        this.requireSnapshot(session_id);
+      this.put(modeKey, supported);
+      for (const { session_id } of this.projectionSessions()) {
+        this.requireSnapshot(session_id, 'projection_changed');
         this.markFilesDirty(session_id);
       }
     });
@@ -239,12 +267,12 @@ export class RemoteStore {
   setAgentSummaryResolver(resolver: ((sessionId: string, owner: RemoteOwner) => RemoteAgentSummary | null) | null): void {
     if (Boolean(this.agentSummary) === Boolean(resolver)) { this.agentSummary = resolver; return; }
     this.agentSummary = resolver;
-    if (resolver) this.db.prepare(`INSERT OR IGNORE INTO remote_dirty SELECT session_id FROM cowork_session_ownership WHERE ownership_status='confirmed'`).run();
+    if (resolver) for (const { session_id } of this.projectionSessions()) this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(session_id);
   }
   setInputProjectionSupported(supported: boolean): void {
     if (this.inputProjectionSupported === supported) return;
     this.inputProjectionSupported = supported;
-    this.db.prepare(`INSERT OR IGNORE INTO remote_dirty SELECT session_id FROM cowork_session_ownership WHERE ownership_status='confirmed'`).run();
+    for (const { session_id } of this.projectionSessions()) this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(session_id);
   }
   inputVersion(sessionId: string): string {
     const row = this.db.prepare('SELECT model_override,thinking_level FROM cowork_sessions WHERE id=?').get(sessionId);
@@ -374,7 +402,10 @@ export class RemoteStore {
     return (this.db.prepare('SELECT local_id FROM remote_sync WHERE session_id=?').get(remoteSessionId) as any)?.local_id || null;
   }
   bindRemote(sessionId: string, remoteId: string, deviceId: string): void {
-    this.db.prepare('UPDATE remote_sync SET session_id=?,device_id=? WHERE local_id=?').run(remoteId, deviceId, sessionId);
+    const row = this.sync(sessionId);
+    if (row?.sync_protocol_version === RemoteRetention.Version && (row.session_id !== remoteId || row.device_id !== deviceId)) throw new RemoteSyncStateError('Cannot rebind an active synchronization stream');
+    this.db.prepare('UPDATE remote_sync SET session_id=?,device_id=?,sync_environment=COALESCE(sync_environment,?) WHERE local_id=?')
+      .run(remoteId, deviceId, this.projectionIdentity?.environment || null, sessionId);
   }
   run(sessionId: string): RemoteRun | null { return this.get<RemoteRun>(`run:${sessionId}`); }
   controlVersion(sessionId: string): string { return this.get<string>(`control:${sessionId}`) || '0'; }
@@ -433,7 +464,8 @@ export class RemoteStore {
   }
   private bumpControl(sessionId: string): void { this.put(`control:${sessionId}`, String(BigInt(this.controlVersion(sessionId)) + 1n)); }
 
-  requireSnapshot(sessionId: string): void {
+  requireSnapshot(sessionId: string, reason = 'local_change'): void {
+    this.put(`snapshotReason:${sessionId}`, reason);
     this.db.prepare('UPDATE remote_sync SET needs_snapshot=1 WHERE local_id=?').run(sessionId);
     this.put(`snapshotEpoch:${sessionId}`, (this.get<number>(`snapshotEpoch:${sessionId}`) || 0) + 1);
   }
@@ -450,8 +482,14 @@ export class RemoteStore {
     this.publishing = true;
     try {
       const dirty = this.db.prepare('SELECT session_id FROM remote_dirty').all() as Array<{ session_id: string }>;
-      if (dirty.length) this.changeVersion++;
+      let processed = false;
       for (const { session_id: id } of dirty) {
+        if (this.sync(id)?.migration_frozen) continue;
+        // Consume only this marker; frozen records survive commits and process restarts.
+        const contentDirty = Boolean(this.db.prepare('SELECT 1 FROM remote_content_dirty WHERE session_id=?').get(id));
+        this.db.prepare('DELETE FROM remote_dirty WHERE session_id=?').run(id);
+        this.db.prepare('DELETE FROM remote_content_dirty WHERE session_id=?').run(id);
+        processed = true;
         const owner = this.owner(id);
         if (!owner) {
           console.debug('[RemoteSync] Projection skipped', { localSessionId: id, reason: 'owner_not_confirmed' });
@@ -463,8 +501,7 @@ export class RemoteStore {
           continue;
         }
         const hasAgentChanges = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_ownership_dirty'").get();
-        const summaryOnly = Boolean(hasAgentChanges && this.db.prepare(`SELECT 1 FROM cowork_sessions s JOIN agent_ownership_dirty a ON a.agent_id=s.agent_id
-          WHERE s.id=? AND NOT EXISTS (SELECT 1 FROM remote_content_dirty c WHERE c.session_id=s.id)`).get(id));
+        const summaryOnly = !contentDirty && Boolean(hasAgentChanges && this.db.prepare(`SELECT 1 FROM cowork_sessions s JOIN agent_ownership_dirty a ON a.agent_id=s.agent_id WHERE s.id=?`).get(id));
         const before = this.sync(id);
         try { this.project(id, summaryOnly); }
         catch (error) {
@@ -478,8 +515,10 @@ export class RemoteStore {
           ackSourceSeq: after.ack_seq, serverSeq: after.server_seq, needsSnapshot: Boolean(after.needs_snapshot),
           controlVersion: this.controlVersion(id), runId: this.run(id)?.runId ?? null, runStatus: this.run(id)?.status ?? null, summaryOnly });
       }
-      this.db.prepare('DELETE FROM remote_dirty').run();
-      this.db.prepare('DELETE FROM remote_content_dirty').run();
+      // Anonymous artifact triggers have no remote_dirty counterpart; they need no durable projection marker.
+      this.db.prepare(`DELETE FROM remote_content_dirty WHERE NOT EXISTS (SELECT 1 FROM remote_dirty d WHERE d.session_id=remote_content_dirty.session_id)
+        AND NOT EXISTS (SELECT 1 FROM cowork_session_ownership o WHERE o.session_id=remote_content_dirty.session_id AND o.ownership_status='confirmed')`).run();
+      if (processed) this.changeVersion++;
     } finally { this.publishing = false; }
   }
   private record(sessionId: string, key: string, record: ProjectionRecord): void {
@@ -514,14 +553,16 @@ export class RemoteStore {
     if (!row) return;
     if (this.replyProjectionSupported && ((record.eventType === 'run.updated' && terminal.has(record.payload.run?.status))
       || record.eventType === 'approval.updated' || (record.eventType === 'tool.upsert' && (record.payload.tool?.revision === '1' || terminal.has(record.payload.tool?.status))))) this.urgentReplyChange = true;
-    const sourceSeq = row.source_seq + 1;
-    const event: RemoteEvent = { ...record, eventId: randomUUID(), sourceSeq: String(sourceSeq), occurredAt: iso(Date.now()) };
+    if (row.migration_frozen) throw new Error('Remote migration projection is frozen');
+    const sourceSeq = safeSourceSequence(String(row.source_seq + 1));
+    const event: RemoteEvent = { ...record, eventId: row.sync_protocol_version === RemoteRetention.Version
+      ? retentionEventId(row.device_id, row.session_id, row.stream_epoch || '', String(sourceSeq)) : randomUUID(), sourceSeq: String(sourceSeq), occurredAt: iso(Date.now()) };
     this.db.prepare('UPDATE remote_sync SET source_seq=? WHERE local_id=?').run(sourceSeq, sessionId);
     // A full snapshot supersedes unsent events only after its durable server commit.
     this.db.prepare('INSERT INTO remote_outbox VALUES (?,?,?)').run(sessionId, sourceSeq, stableJson(event));
     const size = this.db.prepare('SELECT count(*) AS n,sum(length(event_json)) AS bytes FROM remote_outbox WHERE session_id=?').get(sessionId) as any;
     if (size.n > 2000 || size.bytes > 16 * 1024 * 1024) {
-      this.requireSnapshot(sessionId);
+      this.requireSnapshot(sessionId, 'outbox_limit');
       // Snapshot projection is durable; no assigned payload is rewritten or reused.
       this.db.prepare('DELETE FROM remote_outbox WHERE session_id=?').run(sessionId);
     }
@@ -537,6 +578,7 @@ export class RemoteStore {
     this.record(sessionId, `approval:${safe.approvalId}`, { eventType: 'approval.updated', payload: { approval: safe, controlVersion: this.controlVersion(sessionId) } });
   }
   project(sessionId: string, summaryOnly = false): void {
+    if (this.sync(sessionId)?.migration_frozen) return;
     const s = this.db.prepare('SELECT * FROM cowork_sessions WHERE id=?').get(sessionId) as any;
     if (!s) { if (!this.get<string>(`deletedAt:${sessionId}`)) this.requireSnapshot(sessionId); const deletedAt = this.get<string>(`deletedAt:${sessionId}`) || iso(Date.now()); this.put(`deletedAt:${sessionId}`, deletedAt); this.record(sessionId, 'deleted', { eventType: 'session.deleted', payload: { deletedAt } }); return; }
     const storedRun = this.run(sessionId);
@@ -681,7 +723,7 @@ export class RemoteStore {
       const cached = this.db.prepare('SELECT COALESCE(SUM(size_bytes),0) AS bytes FROM remote_reply_chunks WHERE session_id=?').get(sessionId) as { bytes: number };
       const queued = this.db.prepare('SELECT COUNT(*) AS n FROM remote_outbox WHERE session_id=?').get(sessionId) as { n: number };
       if (cached.bytes > 64 * 1024 * 1024 && queued.n > 100) {
-        this.requireSnapshot(sessionId);
+        this.requireSnapshot(sessionId, 'reply_cache_limit');
         this.db.prepare('DELETE FROM remote_outbox WHERE session_id=?').run(sessionId);
         this.pruneReplyContents(sessionId);
       }
@@ -703,10 +745,30 @@ export class RemoteStore {
     for (const row of rows) { const length = Buffer.byteLength(row.event_json); if (result.length && bytes + length > 240 * 1024) break; result.push(JSON.parse(row.event_json)); bytes += length; }
     return result;
   }
+  freezeMigration(sessionId: string): void {
+    this.db.prepare('UPDATE remote_sync SET migration_frozen=1 WHERE local_id=?').run(sessionId);
+  }
+  unfreezeMigration(sessionId: string): void {
+    this.db.prepare('UPDATE remote_sync SET migration_frozen=0 WHERE local_id=?').run(sessionId);
+  }
+  applyRetentionAck(sessionId: string, result: { syncProtocolVersion: number; streamEpoch: string; sourcePurgeSeq: string; eventPurgeSeq: string }, activating = false): void {
+    const row = this.sync(sessionId);
+    if (!row || result.syncProtocolVersion !== RemoteRetention.Version || !result.streamEpoch
+      || (!activating && (row.sync_protocol_version !== RemoteRetention.Version || row.stream_epoch !== result.streamEpoch))
+      || (row.stream_epoch && row.stream_epoch !== result.streamEpoch)) throw new RemoteSyncStateError('Remote stream ACK identity mismatch');
+    const sourceFloor = retentionSequence(result.sourcePurgeSeq);
+    const eventFloor = retentionSequence(result.eventPurgeSeq);
+    if (sourceFloor > BigInt(row.source_seq)) throw new RemoteSyncStateError('Remote retention ACK outside durable bounds');
+    this.db.prepare(`UPDATE remote_sync SET sync_protocol_version=?,stream_epoch=?,source_purge_seq=?,event_purge_seq=? WHERE local_id=?`)
+      .run(RemoteRetention.Version, result.streamEpoch, String(sourceFloor > retentionSequence(row.source_purge_seq) ? sourceFloor : retentionSequence(row.source_purge_seq)),
+        String(eventFloor > retentionSequence(row.event_purge_seq) ? eventFloor : retentionSequence(row.event_purge_seq)), sessionId);
+  }
   acknowledge(sessionId: string, deviceId: string, remoteId: string, committedSourceSeq: string, committedSeq: string, snapshot = false, snapshotEpoch?: number): void {
     this.transaction(() => {
       const row = this.sync(sessionId);
-      const ack = BigInt(committedSourceSeq);
+      const ack = BigInt(safeSourceSequence(committedSourceSeq));
+      const server = retentionSequence(committedSeq);
+      if (row && server < retentionSequence(row.server_seq)) throw new Error('Remote server ACK regressed');
       if (!row || row.session_id !== remoteId || row.device_id !== deviceId || ack < BigInt(row.ack_seq) || ack > BigInt(row.source_seq)) throw new Error('Remote ACK outside durable local bounds');
       this.db.prepare('UPDATE remote_sync SET ack_seq=?,server_seq=?,needs_snapshot=? WHERE local_id=?')
         .run(Number(ack), committedSeq, snapshot && (snapshotEpoch === undefined || snapshotEpoch === (this.get<number>(`snapshotEpoch:${sessionId}`) || 0)) ? 0 : row.needs_snapshot, sessionId);

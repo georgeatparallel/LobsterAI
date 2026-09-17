@@ -39,12 +39,19 @@ type AskUserCallbackInput = AskUserInput & {
   sessionKey?: string;
 };
 
+const AskUserResponseReason = {
+  Timeout: 'timeout',
+  Unavailable: 'unavailable',
+} as const;
+
 type AskUserResponse = {
   behavior: 'allow' | 'deny';
   answers?: Record<string, string>;
+  reason?: typeof AskUserResponseReason[keyof typeof AskUserResponseReason];
 };
 
-const DEFAULT_TIMEOUT_MS = 120_000;
+// Allow the bridge's 120s question deadline to return its explicit timeout reason.
+const CALLBACK_TIMEOUT_MS = 125_000;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -87,7 +94,7 @@ async function askUser(
   input: AskUserCallbackInput,
 ): Promise<AskUserResponse> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), CALLBACK_TIMEOUT_MS);
 
   try {
     const response = await fetch(config.callbackUrl, {
@@ -107,17 +114,20 @@ async function askUser(
     }
 
     if (!text.trim()) {
-      return { behavior: 'deny' };
+      return { behavior: 'deny', reason: AskUserResponseReason.Unavailable };
     }
 
     const parsed = JSON.parse(text);
     return {
       behavior: parsed?.behavior === 'allow' ? 'allow' : 'deny',
       answers: isRecord(parsed?.answers) ? parsed.answers as Record<string, string> : undefined,
+      reason: parsed?.reason === AskUserResponseReason.Timeout || parsed?.reason === AskUserResponseReason.Unavailable
+        ? parsed.reason
+        : undefined,
     };
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      return { behavior: 'deny' };
+      return { behavior: 'deny', reason: AskUserResponseReason.Timeout };
     }
     throw error;
   } finally {
@@ -175,6 +185,17 @@ const plugin = {
           const response = await askUser(config, { ...input, sessionKey });
 
           if (response.behavior === 'deny') {
+            if (response.reason) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: response.reason === AskUserResponseReason.Timeout
+                    ? 'The confirmation request timed out without a user response. No permission was granted; do not execute the operation.'
+                    : 'The confirmation request could not be displayed. No permission was granted; do not execute the operation.',
+                }],
+                isError: true,
+              };
+            }
             return {
               content: [{ type: 'text', text: 'User denied the operation.' }],
             };

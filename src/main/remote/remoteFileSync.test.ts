@@ -276,7 +276,8 @@ describe('artifact sync durable boundaries and protocol', () => {
       metadata: { name: 'pc', hostName: 'pc', instanceLabel: 'default', platform: 'macos', appVersion: '1' }, prepare: vi.fn(), execute: vi.fn(), onAccountChange: vi.fn(),
       request: async (_owner, _pathname, init) => { requests.push(init); return ok({ enabled: true, protocolVersions: [1], projectionVersions: [1, 2, 3], capabilities: [RemoteCapability.SameAccountAccess, ...Object.values(RemoteFileCapability)] }); },
     });
-    bridge.owner = owner; await bridge.refreshCapabilities(); await bridge.refreshCapabilities();
+    bridge.owner = owner; bridge.registration = { deviceId: 'pc', ...owner, metadataVersion: '1' };
+    await bridge.refreshCapabilities(); await bridge.refreshCapabilities();
     expect(bridge.projectionVersion).toBe(3);
     expect(requests.every(init => !new Headers(init.headers).has('X-Remote-Projection-Version'))).toBe(true);
     // File sync can be enabled while the separate Agent/model-selection rollout remains off.

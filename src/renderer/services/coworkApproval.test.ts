@@ -6,7 +6,7 @@ import { store } from '../store';
 import { resetAccountSessionData } from '../store/accountSessionBoundary';
 import { invalidateAuthAccountContext } from '../store/slices/authSlice';
 import { enqueuePendingPermission, updatePendingPermissionState } from '../store/slices/coworkSlice';
-import type { CoworkPermissionRequest } from '../types/cowork';
+import type { CoworkPermissionRequest, CoworkPermissionResult } from '../types/cowork';
 import { coworkService } from './cowork';
 
 vi.mock('./i18n', () => ({ i18nService: { t: (key: string) => key } }));
@@ -60,7 +60,9 @@ test('lost IPC response keeps the decision locked until a later authoritative st
   vi.stubGlobal('window', { electron: { cowork: { respondToPermission } } });
   enqueue();
   expect(await coworkService.respondToPermission('approval-1', allow)).toBe(false);
-  expect(store.getState().cowork.pendingPermissions[0].submissionState).toBe('unknown');
+  expect(store.getState().cowork.pendingPermissions[0]).toMatchObject({
+    submissionState: 'unknown', submissionError: 'coworkApprovalUnknown',
+  });
   await coworkService.respondToPermission('approval-1', { behavior: 'deny', message: 'No' });
   expect(respondToPermission).toHaveBeenCalledTimes(1);
   store.dispatch(updatePendingPermissionState(confirmed()));
@@ -76,6 +78,7 @@ test('known never-dispatched failure unlocks only after the runtime supplies its
   expect(store.getState().cowork.pendingPermissions[0]).toMatchObject({
     approval: { approvalVersion: '3', resolution: { phase: 'idle' } },
     submissionState: undefined,
+    submissionError: 'coworkApprovalNotApplied',
   });
   await coworkService.respondToPermission('approval-1', allow);
   expect(respondToPermission.mock.calls[1][0].expectedVersion).toBe('3');
@@ -119,6 +122,48 @@ const nativeQuestion = (id: string): CoworkPermissionRequest => ({
   sessionId: `session-${id}`,
   toolName: OpenClawQuestion.ToolName,
   toolInput: {},
+});
+
+test.each([
+  { source: 'bridge', requestId: 'question-1' },
+  { source: 'native', requestId: `${OpenClawQuestion.RequestIdPrefix}question-1` },
+])('$source question submission failures remain retryable for selections and refusals', async ({ requestId }) => {
+  const respondToPermission = vi.fn();
+  vi.stubGlobal('window', { electron: { cowork: { respondToPermission } } });
+  const results: CoworkPermissionResult[] = [
+    { behavior: 'allow', updatedInput: { answers: { Cleanup: 'Cancel' } } },
+    { behavior: 'deny', message: 'No' },
+  ];
+
+  for (const result of results) {
+    store.dispatch(enqueuePendingPermission({ ...nativeQuestion('1'), requestId }));
+    respondToPermission.mockResolvedValueOnce({ success: false, error: 'APPROVAL_ACCESS_DENIED' });
+    expect(await coworkService.respondToPermission(requestId, result)).toBe(false);
+    expect(store.getState().cowork.pendingPermissions).toMatchObject([{
+      requestId, submissionState: undefined, submissionError: 'coworkQuestionSubmitFailed',
+    }]);
+    expect(respondToPermission).toHaveBeenLastCalledWith({ requestId, result });
+
+    respondToPermission.mockResolvedValueOnce({ success: true, outcome: { kind: 'question_resolved' } });
+    expect(await coworkService.respondToPermission(requestId, result)).toBe(true);
+    expect(store.getState().cowork.pendingPermissions).toEqual([]);
+  }
+  expect(respondToPermission).toHaveBeenCalledTimes(4);
+});
+
+test('question IPC rejection shows a retryable submission failure instead of approval reconciliation', async () => {
+  const respondToPermission = vi.fn().mockRejectedValueOnce(new Error('IPC disconnected'))
+    .mockResolvedValueOnce({ success: true, outcome: { kind: 'question_resolved' } });
+  vi.stubGlobal('window', { electron: { cowork: { respondToPermission } } });
+  const question = nativeQuestion('1');
+  store.dispatch(enqueuePendingPermission(question));
+
+  expect(await coworkService.respondToPermission(question.requestId, allow)).toBe(false);
+  expect(store.getState().cowork.pendingPermissions).toMatchObject([{
+    requestId: question.requestId, submissionState: undefined, submissionError: 'coworkQuestionSubmitFailed',
+  }]);
+  expect(await coworkService.respondToPermission(question.requestId, allow)).toBe(true);
+  expect(store.getState().cowork.pendingPermissions).toEqual([]);
 });
 
 const setupNativeQuestionRecovery = (getPendingQuestions: () => Promise<CoworkPermissionRequest[]>) => {

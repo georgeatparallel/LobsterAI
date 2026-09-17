@@ -3831,6 +3831,7 @@ const getSkillManager = () => {
 const getMcpRuntime = (): McpRuntime => {
   if (!mcpRuntime) {
     mcpRuntime = new McpRuntime({
+      permissionSessions: coworkPermissionSessions,
       getStore,
       syncOpenClawConfig,
       onAskUserRequested: (sessionId, request) => {
@@ -11022,17 +11023,19 @@ if (!gotTheLock) {
             answers: result.behavior === 'allow'
               ? result.updatedInput?.answers as Record<string, string> | undefined : undefined,
           };
-          getMcpRuntime().resolveAskUser(requestId, response);
-          coworkPermissionSessions.delete(requestId);
-          getDesktopNotificationManager().handlePermissionResolved(requestId);
-          for (const win of BrowserWindow.getAllWindows()) {
-            if (!win.isDestroyed()) win.webContents.send(CoworkIpcChannel.StreamPermissionDismiss, { requestId });
+          if (!getMcpRuntime().resolveAskUser(requestId, response)) {
+            throw new Error('QUESTION_UNAVAILABLE');
           }
         },
       });
       return { success: outcome.kind === 'confirmed' || outcome.kind === 'question_resolved', outcome,
         error: outcome.kind === 'unknown' || outcome.kind === 'known_not_applied' ? outcome.reason : undefined };
     } catch (error) {
+      console.error('[CoworkPermission] Failed to submit response', {
+        requestId: options?.requestId,
+        sessionId: coworkPermissionSessions.get(options?.requestId),
+        behavior: options?.result?.behavior,
+      }, error);
       return { success: false, error: error instanceof Error ? error.message : 'Failed to respond to permission' };
     }
   });
