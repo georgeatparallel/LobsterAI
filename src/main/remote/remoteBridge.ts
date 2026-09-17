@@ -145,7 +145,7 @@ export class RemoteBridge {
     deps.agentOwnership?.subscribe(() => { this.agentCatalogRevision++; this.schedule(300); });
   }
   start(): void {
-    this.stopped = false; this.accountChanged();
+    this.stopped = false; this.deps.input?.preparations.startCleanup?.(); this.accountChanged();
     if (this.files && !this.fileTimer) { this.fileTimer = setInterval(() => this.syncFiles(), 2000); this.fileTimer.unref?.(); }
   }
   private syncFiles(): void {
@@ -154,7 +154,7 @@ export class RemoteBridge {
   }
   canCaptureRemoteFiles(): boolean { return this.files?.canCaptureInput() === true && this.settings().enabled; }
   getInputAgentCatalog(): RemoteAgentCatalog | null { return this.agentCatalog; }
-  stop(): void { this.stopped = true; if (this.timer) clearTimeout(this.timer); this.timer = null;
+  stop(): void { this.deps.input?.preparations.stopCleanup?.(); this.stopped = true; if (this.timer) clearTimeout(this.timer); this.timer = null;
     if (this.fileTimer) clearInterval(this.fileTimer); this.fileTimer = null; this.files?.pause(); this.disconnect(); }
   accountChanged(): void { this.ensureAccount(); this.schedule(0); }
   private changed(): void { this.deps.onStateChange?.(); }

@@ -18,6 +18,7 @@ export interface LocalPreparedInput {
   resolvedInput: RemoteResolvedInput; cwd: string; directoryIdentity: FileIdentity; runtimeRef: string;
   sessionId: string | null; expectedInputVersion: string | null; expectedControlVersion: string | null;
   files: LocalAsset[]; createdAt: number; expiresAt: number; boundCommandId: string | null;
+  cacheDirectory?: string; cacheCleanup?: 'deleting';
 }
 interface Dependencies {
   store: CoworkStore; models: RemoteModelCatalog; cacheRoot: string; getOwner(): RemoteOwner | null;
@@ -47,7 +48,61 @@ const hashFile = async (filePath: string, check: () => void): Promise<string> =>
 
 /** No runtime mutation occurs here. An immutable local manifest is required again at dispatch. */
 export class InputPreparationService {
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private cleanupRunning = false;
+  private cleanupCursor = '';
   constructor(private readonly deps: Dependencies) {}
+  startCleanup(): void {
+    if (this.cleanupTimer) return;
+    const run = (): void => { void this.cleanupExpired().catch(() => console.warn('[RemoteInput] Cache cleanup deferred')); };
+    this.cleanupTimer = setInterval(run, 60_000); this.cleanupTimer.unref?.(); run();
+  }
+  stopCleanup(): void { if (this.cleanupTimer) clearInterval(this.cleanupTimer); this.cleanupTimer = null; }
+  /** Remote command lifetimes are <=60s. Keep unbound ready files a further day so a
+   * previously accepted command cannot lose its input while waiting for delivery. */
+  async cleanupExpired(now = Date.now()): Promise<number> {
+    if (this.cleanupRunning) return 0;
+    this.cleanupRunning = true;
+    let removed = 0;
+    try {
+      const rows = this.deps.store.remote.entries<LocalPreparedInput>('inputPreparation:', this.cleanupCursor, 50);
+      for (const row of rows) {
+        this.cleanupCursor = row.key;
+        const current = this.deps.store.remote.get<LocalPreparedInput>(row.key);
+        if (!current || current.boundCommandId || !Number.isFinite(current.expiresAt) || current.expiresAt > now - 24 * 60 * 60_000) continue;
+        // Claim synchronously before filesystem awaits; bind/read reject this durable marker.
+        this.deps.store.remote.put(row.key, { ...current, cacheCleanup: 'deleting' });
+        try {
+          const folder = await this.cleanupDirectory(current);
+          if (folder) await fs.rm(folder, { recursive: true, force: true });
+          this.deps.store.remote.remove(row.key); removed++;
+        } catch { console.warn('[RemoteInput] Expired input retained for cleanup retry'); }
+      }
+      if (rows.length < 50) this.cleanupCursor = '';
+      return removed;
+    } finally { this.cleanupRunning = false; }
+  }
+  private async cleanupDirectory(prepared: LocalPreparedInput): Promise<string | null> {
+    const paths = prepared.files.flatMap(file => [file.path, ...(file.imagePath ? [file.imagePath] : [])]);
+    const folder = prepared.cacheDirectory || (paths.length ? path.dirname(paths[0]) : null);
+    if (!folder) return null; // Old text-only records did not retain their empty directory.
+    const root = path.resolve(this.deps.cacheRoot);
+    const parent = path.join(root, payloadHash([prepared.owner.userId, prepared.owner.scopeKey, prepared.deviceId]));
+    if (path.dirname(path.resolve(folder)) !== parent || !/^[0-9a-f-]{36}$/iu.test(path.basename(folder))
+      || paths.some(file => path.dirname(path.resolve(file)) !== path.resolve(folder))) throw new Error('Unsafe input cache directory');
+    // Refuse symlinked owner/directory components. rm must never traverse into user files.
+    try {
+      const rootReal = await fs.realpath(root);
+      const parentInfo = await fs.lstat(parent);
+      if (parentInfo.isSymbolicLink() || !parentInfo.isDirectory() || await fs.realpath(parent) !== path.join(rootReal, path.basename(parent))) throw new Error('Unsafe input cache parent');
+      const info = await fs.lstat(folder);
+      if (info.isSymbolicLink() || !info.isDirectory() || await fs.realpath(folder) !== path.join(rootReal, path.basename(parent), path.basename(folder))) throw new Error('Unsafe input cache directory');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+    return folder;
+  }
   private key(id: string): string { return `inputPreparation:${id}`; }
   private assertOwner(owner: RemoteOwner, current: () => boolean): void {
     if (!sameOwner(owner, this.deps.getOwner()) || !current()) throw new RemoteInputError(RemoteInputReason.Account);
@@ -163,7 +218,7 @@ export class InputPreparationService {
       const prepared: LocalPreparedInput = { preparationId: claim.preparationId, owner, deviceId, requestHash: payloadHash(request),
         inputDigest: payloadHash(resolvedInput), resolvedInput, cwd, directoryIdentity, runtimeRef: model.local.runtimeRef,
         sessionId: session?.id || null, expectedInputVersion: request.expectedInputVersion || null, expectedControlVersion: request.expectedControlVersion || null,
-        files, createdAt: Date.now(), expiresAt: Math.min(Date.now() + 15 * 60_000, claim.expiresAt ? Date.parse(claim.expiresAt) : Infinity), boundCommandId: null };
+        files, cacheDirectory: folder, createdAt: Date.now(), expiresAt: Math.min(Date.now() + 15 * 60_000, claim.expiresAt ? Date.parse(claim.expiresAt) : Infinity), boundCommandId: null };
       this.validate(prepared, owner, deviceId, false);
       this.deps.store.remote.put(this.key(claim.preparationId), prepared);
       return prepared;
@@ -171,11 +226,11 @@ export class InputPreparationService {
   }
   read(id: string, owner: RemoteOwner, deviceId: string): LocalPreparedInput {
     const prepared = this.deps.store.remote.get<LocalPreparedInput>(this.key(id));
-    if (!prepared || !sameOwner(prepared.owner, owner) || prepared.deviceId !== deviceId) throw new RemoteInputError(RemoteInputReason.Stale);
+    if (!prepared || prepared.cacheCleanup || !sameOwner(prepared.owner, owner) || prepared.deviceId !== deviceId) throw new RemoteInputError(RemoteInputReason.Stale);
     return prepared;
   }
   validate(prepared: LocalPreparedInput, owner: RemoteOwner, deviceId: string, bound: boolean): void {
-    if (!sameOwner(prepared.owner, owner) || !sameOwner(owner, this.deps.getOwner()) || prepared.deviceId !== deviceId
+    if (prepared.cacheCleanup || !sameOwner(prepared.owner, owner) || !sameOwner(owner, this.deps.getOwner()) || prepared.deviceId !== deviceId
       || (!bound && prepared.expiresAt <= Date.now()) || payloadHash(prepared.resolvedInput) !== prepared.inputDigest) throw new RemoteInputError(RemoteInputReason.Stale);
     const input = prepared.resolvedInput;
     const model = this.deps.models.resolve(owner, deviceId, input.model.modelRef, input.model.version);
@@ -192,8 +247,10 @@ export class InputPreparationService {
     for (const file of prepared.files) if (!sameFile(file.path, file.identity) || file.imagePath && !sameFile(file.imagePath, file.imageIdentity!)) throw new RemoteInputError(RemoteInputReason.Stale);
   }
   bind(prepared: LocalPreparedInput, commandId: string): void {
-    if (prepared.boundCommandId && prepared.boundCommandId !== commandId) throw new RemoteInputError(RemoteInputReason.Stale);
-    prepared.boundCommandId = commandId; this.deps.store.remote.put(this.key(prepared.preparationId), prepared);
+    const current = this.deps.store.remote.get<LocalPreparedInput>(this.key(prepared.preparationId));
+    if (!current || current.cacheCleanup || current.requestHash !== prepared.requestHash || !sameOwner(current.owner, prepared.owner)
+      || current.deviceId !== prepared.deviceId || current.boundCommandId && current.boundCommandId !== commandId) throw new RemoteInputError(RemoteInputReason.Stale);
+    Object.assign(prepared, current, { boundCommandId: commandId }); this.deps.store.remote.put(this.key(prepared.preparationId), prepared);
   }
   confirmReady(id: string, owner: RemoteOwner, deviceId: string, expiresAt: string): void {
     const prepared = this.read(id, owner, deviceId);

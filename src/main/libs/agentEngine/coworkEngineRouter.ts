@@ -19,6 +19,7 @@ import type {
   CoworkRuntime,
   CoworkRuntimeEvents,
   CoworkSessionPatchResult,
+  CoworkSessionRecoverySnapshot,
   CoworkStartOptions,
   PermissionRequest,
   PermissionResult,
@@ -138,6 +139,20 @@ export class CoworkEngineRouter extends EventEmitter implements CoworkRuntime {
       throw new Error(`Session patch is not supported by engine: ${engine}`);
     }
     return this.runtime.patchSession(sessionId, patch);
+  }
+
+  getRecoveryGatewayBootId(): string { return this.runtime.getRecoveryGatewayBootId?.() || ''; }
+
+  getRecoveryGatewayProcessPid(): number | undefined { return this.runtime.getRecoveryGatewayProcessPid?.(); }
+
+  async querySessionRecovery(sessionId: string, gatewayRunId?: string, writerPid?: number): Promise<CoworkSessionRecoverySnapshot | null> {
+    this.assertSessionAccess(sessionId);
+    return this.runtime.querySessionRecovery?.(sessionId, gatewayRunId, writerPid) ?? null;
+  }
+
+  restoreSessionObservation(sessionId: string, remoteRunId: string, snapshot: CoworkSessionRecoverySnapshot): boolean {
+    this.assertSessionAccess(sessionId);
+    return this.runtime.restoreSessionObservation?.(sessionId, remoteRunId, snapshot) ?? false;
   }
 
   async getContextUsage(sessionId: string): Promise<CoworkContextUsage | null> {

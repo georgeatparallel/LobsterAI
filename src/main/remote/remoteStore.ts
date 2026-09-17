@@ -130,7 +130,7 @@ export class RemoteStore {
     // Process exits are not completion evidence. Preserve run identity for reconciliation.
     for (const row of this.db.prepare("SELECT key,value FROM remote_state WHERE key LIKE 'run:%'").all() as any[]) {
       const run = JSON.parse(row.value) as RemoteRun;
-      if (!terminal.has(run.status)) this.put(row.key, { ...run, status: 'reconciling', statusVersion: String(BigInt(run.statusVersion) + 1n) });
+      if (!terminal.has(run.status)) this.updateRun(String(row.key).slice('run:'.length), 'reconciling');
     }
   }
 
@@ -295,8 +295,12 @@ export class RemoteStore {
     this.db.prepare('INSERT INTO remote_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, stableJson(value));
   }
   remove(key: string): void { this.db.prepare('DELETE FROM remote_state WHERE key=?').run(key); }
-  entries<T>(prefix: string): Array<{ key: string; value: T }> {
-    return (this.db.prepare('SELECT key,value FROM remote_state WHERE key LIKE ?').all(`${prefix}%`) as any[])
+  entries<T>(prefix: string, after?: string, limit?: number): Array<{ key: string; value: T }> {
+    const rows = after !== undefined || limit !== undefined
+      ? this.db.prepare('SELECT key,value FROM remote_state WHERE key LIKE ? AND key>? ORDER BY key LIMIT ?')
+        .all(`${prefix}%`, after || '', Math.max(1, Math.min(200, Number.isFinite(limit) ? Math.floor(limit!) : 50)))
+      : this.db.prepare('SELECT key,value FROM remote_state WHERE key LIKE ?').all(`${prefix}%`);
+    return (rows as any[])
       .map(row => ({ key: row.key, value: JSON.parse(row.value) as T }));
   }
   transaction<T>(operation: () => T): T {

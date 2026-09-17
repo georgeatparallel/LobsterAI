@@ -176,6 +176,7 @@ import {
   shouldReplaceLocalConversationWithCronHistory,
 } from './openclawCronRunHistorySync';
 import { OpenClawQuestionController } from './openclawQuestionController';
+import { readOpenClawSessionRecovery } from './openclawSessionRecovery';
 import {
   buildOpenClawTranscriptOversizedError,
   inspectOpenClawTranscriptSafety,
@@ -225,6 +226,7 @@ import type {
   CoworkRuntime,
   CoworkRuntimeEvents,
   CoworkSessionPatchResult,
+  CoworkSessionRecoverySnapshot,
   CoworkStartOptions,
   PermissionRequest,
   PermissionResult,
@@ -2529,6 +2531,8 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   private static readonly PLAN_MODE_SAFETY_RECOVERY_AFTER_LIFECYCLE_END_MS = 1_500;
 
   private gatewayClient: GatewayClientLike | null = null;
+  private recoveryGatewayBootId = '';
+  private recoveryGatewayProcessPid: number | null = null;
   private gatewayClientVersion: string | null = null;
   private gatewayClientEntryPath: string | null = null;
   private gatewayClientGeneration = 0;
@@ -3109,6 +3113,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     source: string;
     reason: string;
     timeoutMs?: number;
+    inputFenceOperationId?: string;
   }): Promise<OpenClawSessionPatchGatewayResult | undefined> {
     const { sessionId, sessionKey, patch, source, reason } = options;
     const timeoutMs = options.timeoutMs ?? OpenClawRuntimeAdapter.SESSION_PATCH_TIMEOUT_MS;
@@ -3132,6 +3137,17 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     let response: OpenClawSessionPatchGatewayResult | undefined;
     try {
       const client = this.requireGatewayClient();
+      if (options.inputFenceOperationId) {
+        const fence = this.store.remote.get<Record<string, unknown>>(`inputFence:${sessionId}`);
+        if (fence?.operationId !== options.inputFenceOperationId
+          || !this.store.canReadSession(sessionId, this.store.remoteCreationOwner())
+          || this.getRecoveryGatewayProcessPid() !== (this.engineManager.getGatewayProcessPid?.() ?? undefined)) {
+          throw new Error('Session configuration writer changed before dispatch');
+        }
+        // Record the actual selected client/writer after all readiness and model-queue awaits.
+        this.store.remote.put(`inputFence:${sessionId}`, { ...fence,
+          gatewayBootId: this.getRecoveryGatewayBootId(), gatewayProcessPid: this.getRecoveryGatewayProcessPid() ?? null });
+      }
       response = await client.request<OpenClawSessionPatchGatewayResult>('sessions.patch', {
         key: sessionKey,
         ...patch,
@@ -5117,11 +5133,48 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     return goal;
   }
 
+  getRecoveryGatewayBootId(): string { return this.gatewayClient ? this.recoveryGatewayBootId : ''; }
+
+  getRecoveryGatewayProcessPid(): number | undefined { return this.gatewayClient ? this.recoveryGatewayProcessPid ?? undefined : undefined; }
+
+  async querySessionRecovery(sessionId: string, gatewayRunId?: string, writerPid?: number): Promise<CoworkSessionRecoverySnapshot | null> {
+    await this.ensureGatewayClientReady();
+    const client = this.gatewayClient;
+    const key = this.resolveInteractiveSessionKey(sessionId, { requirePersistedChannelKey: true });
+    if (!client || !key) return null;
+    const bootId = this.recoveryGatewayBootId;
+    const pid = this.getRecoveryGatewayProcessPid();
+    if (pid !== (this.engineManager.getGatewayProcessPid?.() ?? undefined)) return null;
+    let previousWriterStopped = false;
+    // A server self-restart changes bootId without ending its Node process. Only an exited
+    // process proves that an earlier timed-out mutation can no longer write the session store.
+    if (pid && Number.isSafeInteger(writerPid) && writerPid! > 0 && writerPid !== pid) {
+      try { process.kill(writerPid!, 0); } catch (error) {
+        previousWriterStopped = (error as NodeJS.ErrnoException).code === 'ESRCH';
+      }
+    }
+    const snapshot = await readOpenClawSessionRecovery(client, key, bootId, gatewayRunId);
+    return client === this.gatewayClient && bootId === this.recoveryGatewayBootId && pid === this.getRecoveryGatewayProcessPid()
+      && pid === (this.engineManager.getGatewayProcessPid?.() ?? undefined)
+      ? { ...snapshot, gatewayProcessPid: pid, previousWriterStopped } : null;
+  }
+
+  restoreSessionObservation(sessionId: string, remoteRunId: string, snapshot: CoworkSessionRecoverySnapshot): boolean {
+    if (!this.store.canReadSession(sessionId, this.store.remoteCreationOwner())
+      || this.store.remote.run(sessionId)?.runId !== remoteRunId || snapshot.status !== 'running'
+      || !snapshot.runId || snapshot.gatewayBootId !== this.getRecoveryGatewayBootId()
+      || snapshot.sessionKey !== this.resolveInteractiveSessionKey(sessionId, { requirePersistedChannelKey: true })) return false;
+    this.rememberSessionKey(sessionId, snapshot.sessionKey);
+    this.ensureActiveTurn(sessionId, snapshot.sessionKey, snapshot.runId);
+    return this.activeTurns.get(sessionId)?.knownRunIds.has(snapshot.runId) ?? false;
+  }
+
   async patchSession(sessionId: string, patch: OpenClawSessionPatch): Promise<CoworkSessionPatchResult> {
     const session = this.store.getSession(sessionId);
     if (!session) {
       throw new Error(`Session ${sessionId} not found`);
     }
+    const inputFenceOperationId = this.store.remote.get<{ operationId: string }>(`inputFence:${sessionId}`)?.operationId;
 
     const targetSessionKey = this.resolveInteractiveSessionKey(sessionId, {
       requirePersistedChannelKey: true,
@@ -5166,6 +5219,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           patch: gatewayPatch,
           source: 'patchSession',
           reason: 'user-requested session patch',
+          inputFenceOperationId,
           timeoutMs: OpenClawRuntimeAdapter.SESSION_PATCH_TIMEOUT_MS,
         });
         this.markGatewayRpcSuccess();
@@ -6134,6 +6188,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   private async createGatewayClient(connection: OpenClawGatewayConnectionInfo): Promise<void> {
     const GatewayClient = await this.loadGatewayClientCtor(connection.clientEntryPath);
     const clientGeneration = ++this.gatewayClientGeneration;
+    const connectionPid = this.engineManager.getGatewayProcessPid?.() ?? null;
 
     let resolveReady: (() => void) | null = null;
     let rejectReady: ((error: Error) => void) | null = null;
@@ -6180,8 +6235,16 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         // Expose the client only after the connect handshake completes.
         // Setting gatewayClient earlier would let concurrent code send
         // request frames before the connect frame, causing 1008 rejection.
+        if (connectionPid !== (this.engineManager.getGatewayProcessPid?.() ?? null)
+          || (this.engineManager.getGatewayConnectionInfo && connection.generation !== this.engineManager.getGatewayConnectionInfo().generation)) {
+          settleReject(new Error('Gateway process changed during handshake'));
+          client.stop();
+          return;
+        }
         this.gatewayClient = client;
         this.gatewayClientVersion = connection.version;
+        this.recoveryGatewayProcessPid = connectionPid;
+        this.recoveryGatewayBootId = hello?.server?.bootId || '';
         this.approvalController.setGatewayContract({ version: hello?.server?.version ?? '', bootId: hello?.server?.bootId ?? '', methods: hello?.features?.methods ?? [] });
         this.gatewayClientEntryPath = connection.clientEntryPath;
         this.gatewayReconnectSuppressed = false;
@@ -12379,7 +12442,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     const turn = this.activeTurns.get(sessionId);
     if (!turn) return;
     if (turn.remoteRunId && turn.remoteRunId === this.store.remote?.run(sessionId)?.runId) {
-      this.store.remote.put(`gatewayRun:${sessionId}`, { runId: normalizedRunId, remoteRunId: turn.remoteRunId });
+      this.store.remote.put(`gatewayRun:${sessionId}`, { runId: normalizedRunId, remoteRunId: turn.remoteRunId, sessionKey: turn.sessionKey, gatewayBootId: this.getRecoveryGatewayBootId() });
     }
     if (!turn.knownRunIds.has(normalizedRunId)) {
       this.cancelLifecycleErrorFallback(turn);

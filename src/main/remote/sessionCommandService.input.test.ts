@@ -94,7 +94,7 @@ it('retains a durable fence for an unknown model patch instead of unlocking on t
   await expect(service.execute(entry, () => true)).rejects.toThrow('transport result unknown');
   expect(remote.get('inputFence:local')).toMatchObject({ operationId: 'cmd', phase: 'model_applying' });
   remote.updateRun('local', 'failed');
-  await expect(service.patchConfiguration('local', { model: 'provider/other' })).rejects.toThrow(RemoteInputReason.Busy);
+  await expect(service.patchConfiguration('local', { model: 'provider/other' })).rejects.toMatchObject({ reason: RemoteInputReason.Busy });
   expect(send).not.toHaveBeenCalled();
 });
 it('rejects tampered prepared references before creating a run or patching the gateway', () => {

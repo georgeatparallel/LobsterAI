@@ -34,11 +34,97 @@ export const markRemoteExecutionDispatched = (): void => {
   if (active) { active.stillPermitted = undefined; active.assertAgentBinding = undefined; }
 };
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
+interface InputFence {
+  operationId: string;
+  phase: string;
+  target?: { model?: string | null; thinkingLevel?: string | null };
+  gatewayBootId?: string;
+  gatewayProcessPid?: number;
+  remoteRunId?: string;
+}
+
 
 /** All local/mobile submissions pass this account fence and per-session control lane. */
 export class SessionCommandService {
   private readonly submitting = new Set<string>();
   private readonly configurationLane = new Map<string, string>();
+  private readonly recovering = new Map<string, Promise<boolean>>();
+
+  /** A bounded local-Gateway reconciliation, never an HTTP/WS remote-control prerequisite. */
+  reconcileSession(sessionId: string): Promise<boolean> {
+    const existing = this.recovering.get(sessionId);
+    if (existing) return existing;
+    const operation = this.reconcileSessionOnce(sessionId).finally(() => {
+      if (this.recovering.get(sessionId) === operation) this.recovering.delete(sessionId);
+    });
+    this.recovering.set(sessionId, operation);
+    return operation;
+  }
+
+  private async reconcileSessionOnce(sessionId: string): Promise<boolean> {
+    const actor = this.getOwner();
+    const generation = this.ownershipOptions.getGeneration?.();
+    this.store.remote.assertActor(sessionId, actor);
+    const fence = this.store.remote.get<InputFence>(`inputFence:${sessionId}`);
+    const run = this.store.remote.run(sessionId);
+    if (!fence && run?.status !== 'reconciling') return !run || terminal.has(run.status);
+    if (!this.runtime.querySessionRecovery || this.submitting.has(sessionId) || this.configurationLane.has(sessionId)) return false;
+    const lane = randomUUID(); this.configurationLane.set(sessionId, lane);
+    const mapping = this.store.remote.get<{ runId: string; remoteRunId: string }>(`gatewayRun:${sessionId}`);
+    const gatewayRunId = mapping?.remoteRunId === run?.runId ? mapping?.runId : undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let changed = false;
+    try {
+      const snapshot = await Promise.race([
+        this.runtime.querySessionRecovery(sessionId, gatewayRunId, fence?.gatewayProcessPid).catch((): null => null),
+        new Promise<null>(resolve => { timeout = setTimeout(() => resolve(null), 4500); }),
+      ]);
+      if (!snapshot || generation !== this.ownershipOptions.getGeneration?.()
+        || (actor ? !sameOwner(actor, this.getOwner()) : this.getOwner() !== null)) return false;
+      this.store.remote.assertActor(sessionId, actor);
+      if (payloadHash(this.store.remote.run(sessionId)) !== payloadHash(run)
+        || payloadHash(this.store.remote.get(`gatewayRun:${sessionId}`)) !== payloadHash(mapping)
+        || this.store.remote.get<InputFence>(`inputFence:${sessionId}`)?.operationId !== fence?.operationId) return false;
+      const locallyActive = this.runtime.isSessionActive?.(sessionId) === true;
+      if (fence && !locallyActive && snapshot.hasActiveRun === false && snapshot.configuration) {
+        const config = snapshot.configuration;
+        const oldWriterStopped = Boolean(fence.gatewayProcessPid && snapshot.previousWriterStopped === true);
+        if (oldWriterStopped) {
+          this.store.remote.transaction(() => {
+            this.store.updateSession(sessionId, { modelOverride: config.modelOverride,
+              thinkingLevel: parseModelThinkingLevel(config.thinkingLevel) || '' }, { touchUpdatedAt: false });
+            this.store.remote.inputVersion(sessionId); this.recordCurrentInputModel(sessionId);
+            this.store.remote.put(`inputOperation:${fence.operationId}`, { phase: 'reconciled', afterVersion: this.store.remote.inputVersion(sessionId) });
+            this.store.remote.remove(`inputFence:${sessionId}`);
+            changed = true;
+            // This durable marker precedes dispatch and is removed before any engine send.
+            if (!mapping && run?.status === 'reconciling' && fence.remoteRunId === run.runId
+              && this.store.remote.get(`runCommand:${sessionId}`) === fence.operationId) this.store.remote.updateRun(sessionId, 'interrupted');
+          });
+        }
+      }
+      if (run?.status === 'reconciling' && gatewayRunId && snapshot.runId === gatewayRunId) {
+        if (snapshot.status === 'running') {
+          if (this.runtime.restoreSessionObservation?.(sessionId, run.runId, snapshot)) this.store.remote.updateRun(sessionId, 'running');
+        } else if (!locallyActive && snapshot.hasActiveRun === false && terminal.has(snapshot.status)) {
+          this.store.remote.transaction(() => {
+            this.store.remote.updateRun(sessionId, snapshot.status as 'succeeded' | 'failed' | 'cancelled');
+            this.store.updateSession(sessionId, { status: snapshot.status === 'succeeded' ? 'completed' : snapshot.status === 'failed' ? 'error' : 'idle' }, { touchUpdatedAt: false });
+            changed = true;
+          });
+        }
+      }
+      if (changed) {
+        try { this.ownershipOptions.onRecovered?.(sessionId); } catch { /* UI notification cannot undo confirmed local state. */ }
+      }
+      const current = this.store.remote.run(sessionId);
+      return !this.store.remote.get(`inputFence:${sessionId}`) && (!current || terminal.has(current.status));
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (this.configurationLane.get(sessionId) === lane) this.configurationLane.delete(sessionId);
+    }
+  }
+
   private input: { preparations: InputPreparationService; models: RemoteModelCatalog; getDeviceId(): string | undefined } | null = null;
   configureInput(input: NonNullable<SessionCommandService['input']>): void { this.input = input; }
   recordCurrentInputModel(sessionId: string): Record<string, unknown> | null {
@@ -70,9 +156,15 @@ export class SessionCommandService {
     const actor = this.getOwner();
     const generation = this.ownershipOptions.getGeneration?.();
     this.store.remote.assertActor(sessionId, actor);
+    await this.reconcileSession(sessionId);
+    if (generation !== this.ownershipOptions.getGeneration?.() || (actor ? !sameOwner(actor, this.getOwner()) : this.getOwner() !== null)) throw new RemoteInputError(RemoteInputReason.Account);
+    this.store.remote.assertActor(sessionId, actor);
     const run = this.store.remote.run(sessionId);
-    if (this.submitting.has(sessionId) || this.configurationLane.has(sessionId) || this.store.remote.get(`inputFence:${sessionId}`)
-      || run && !terminal.has(run.status)) throw new RemoteInputError(RemoteInputReason.Busy);
+    if (this.submitting.has(sessionId) || this.configurationLane.has(sessionId)) throw new RemoteInputError(RemoteInputReason.Busy);
+    if (this.store.remote.get(`inputFence:${sessionId}`) || run?.status === 'reconciling') {
+      const error = new RemoteInputError(RemoteInputReason.Busy); error.message = t('remoteSessionRecoveryRequired'); throw error;
+    }
+    if (run && !terminal.has(run.status)) throw new RemoteInputError(RemoteInputReason.Busy);
     const token = randomUUID(); this.configurationLane.set(sessionId, token);
     const check = (): void => {
       if (generation !== this.ownershipOptions.getGeneration?.() || (actor ? !sameOwner(actor, this.getOwner()) : this.getOwner() !== null)) throw new RemoteInputError(RemoteInputReason.Account);
@@ -80,7 +172,7 @@ export class SessionCommandService {
     };
     try {
       check(); this.store.remote.inputVersion(sessionId);
-      this.store.remote.put(`inputFence:${sessionId}`, { operationId: token, phase: 'model_applying' });
+      this.store.remote.put(`inputFence:${sessionId}`, { operationId: token, phase: 'model_applying', target: patch, gatewayBootId: '', gatewayProcessPid: null });
       const result = await this.runtime.patchSession(sessionId, patch);
       check();
       this.store.updateSession(sessionId, {
@@ -94,7 +186,7 @@ export class SessionCommandService {
   private startHandler: ((options: any) => Promise<any>) | null = null;
   private continueHandler: ((options: any) => Promise<any>) | null = null;
   constructor(private readonly store: CoworkStore, private readonly runtime: CoworkRuntime, private readonly getOwner: () => RemoteOwner | null,
-    private readonly ownershipOptions: { gate?: OwnershipOperationGate; getGeneration?: () => number | string } = {}) {
+    private readonly ownershipOptions: { gate?: OwnershipOperationGate; getGeneration?: () => number | string; onRecovered?: (sessionId: string) => void } = {}) {
     runtime.on('sessionStatus', (id, status) => {
       if (status !== 'running') return;
       // Anonymous tasks also need per-run approval identity; ownership still controls upload.
@@ -133,6 +225,15 @@ export class SessionCommandService {
     const id = create ? inherited?.preparedSessionId : options.sessionId;
     if (id) {
       this.store.remote.assertActor(id, actor);
+      if (!inherited) {
+        if (this.submitting.has(id) || this.configurationLane.has(id)) return { success: false, error: 'REMOTE_SESSION_BUSY' };
+        await this.reconcileSession(id);
+        if (generation !== this.ownershipOptions.getGeneration?.() || (actor ? !sameOwner(actor, this.getOwner()) : this.getOwner() !== null)) throw new RemoteInputError(RemoteInputReason.Account);
+        this.store.remote.assertActor(id, actor);
+        if (this.store.remote.get(`inputFence:${id}`) || this.store.remote.run(id)?.status === 'reconciling') {
+          return { success: false, error: t('remoteSessionRecoveryRequired'), recoveryRequired: true };
+        }
+      }
       if (this.submitting.has(id) || this.configurationLane.has(id) && this.configurationLane.get(id) !== inherited?.commandId || this.store.remote.get(`inputFence:${id}`)) return { success: false, error: 'REMOTE_SESSION_BUSY' };
       const run = this.store.remote.run(id);
       if (run && !terminal.has(run.status) && run.runId !== inherited?.runId) return { success: false, error: 'REMOTE_SESSION_BUSY' };
@@ -273,7 +374,8 @@ export class SessionCommandService {
           const beforeVersion = this.store.remote.inputVersion(localId);
           if (entry.command.type === 'send_message' && request.expectedInputVersion !== beforeVersion) throw new RemoteInputError(RemoteInputReason.Version);
           if (entry.command.type === 'send_message') {
-            this.store.remote.put(`inputFence:${localId}`, { operationId: entry.command.commandId, phase: 'model_applying', beforeVersion });
+            this.store.remote.put(`inputFence:${localId}`, { operationId: entry.command.commandId, phase: 'model_applying', beforeVersion, remoteRunId: entry.runId,
+              target: { model: options.modelOverride, thinkingLevel: options.thinkingLevel || null }, gatewayBootId: '', gatewayProcessPid: null });
             await this.runtime.patchSession(localId, { model: options.modelOverride, thinkingLevel: options.thinkingLevel || null });
             // A confirmed patch remains a fact even if the send permit expires during the await.
             if (!sameOwner(entry.owner, this.getOwner())) throw new Error('Account changed during model application');

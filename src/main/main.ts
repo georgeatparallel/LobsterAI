@@ -5749,7 +5749,12 @@ if (!gotTheLock) {
     // Store-backed services and listeners must wait for initApp's database initialization.
     getCoworkStore().remoteCreationOwner = getCurrentRemoteOwner;
     remoteSessionCommands = new SessionCommandService(getCoworkStore(), getCoworkEngineRouter(), getCurrentRemoteOwner,
-      { getGeneration: () => `${ownershipAccountEpoch}:${authAccountGeneration}` });
+      { getGeneration: () => `${ownershipAccountEpoch}:${authAccountGeneration}`, onRecovered: sessionId => {
+        if (!getCoworkStore().canReadSession(sessionId, getCurrentRemoteOwner())) return;
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(CoworkIpcChannel.SessionsChanged, { sessionIds: [sessionId] });
+        }
+      } });
     remoteSessionCommands.configure(submitStart, submitContinue);
     ownershipAssociations = new OwnershipAssociationService({
       store: getCoworkStore(), gate: ownershipOperationGate,
@@ -10579,6 +10584,8 @@ if (!gotTheLock) {
   ipcMain.handle(CoworkIpcChannel.GetSession, async (_event, sessionId: string) => {
     try {
       getCoworkStore().remote.assertActor(sessionId, getCurrentRemoteOwner());
+      // Opening history must not wait for remote transport or even a degraded local Gateway.
+      void remoteSessionCommands?.reconcileSession(sessionId).catch((): void => undefined);
       const session = getCoworkStore().getSession(sessionId);
       if (session) {
         console.log(

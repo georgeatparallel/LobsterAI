@@ -10658,7 +10658,7 @@ test('persists gateway bindings only for a current active remote run after close
   adapter.bindRunIdToTurn('s', 'closed-old'); expect(remote.put).not.toHaveBeenCalled();
   adapter.isRecentlyClosedRunId = () => false;
   adapter.bindRunIdToTurn('s', 'current');
-  expect(remote.put).toHaveBeenCalledWith('gatewayRun:s', { runId: 'current', remoteRunId: 'remote-current' });
+  expect(remote.put).toHaveBeenCalledWith('gatewayRun:s', { runId: 'current', remoteRunId: 'remote-current', sessionKey: 'key', gatewayBootId: '' });
   remote.put.mockClear(); remote.run.mockReturnValue({ runId: 'reserved-next' });
   adapter.bindRunIdToTurn('s', 'late-alias'); expect(remote.put).not.toHaveBeenCalled();
   adapter.activeTurns.clear(); adapter.bindRunIdToTurn('s', 'no-turn'); expect(remote.put).not.toHaveBeenCalled();
@@ -10680,4 +10680,63 @@ test('an execution target invalidated during async preparation never reaches cha
   releaseFirstModelPatch();
   await rejected;
   expect(requests.some(request => request.method === 'chat.send')).toBe(false);
+});
+
+
+test('session recovery connects the local gateway and only proves a recorded writer exited on ESRCH', async () => {
+  const request = vi.fn(async () => ({ sessions: [{ key: 'key', hasActiveRun: false,
+    modelProvider: 'provider', model: 'model', modelOverrideSource: 'user' }] }));
+  const adapter = new OpenClawRuntimeAdapter({} as never, { getGatewayProcessPid: () => 5678 } as never);
+  adapter.resolveInteractiveSessionKey = () => 'key';
+  adapter.ensureGatewayClientReady = vi.fn(async () => {
+    adapter.gatewayClient = { request, start: () => {}, stop: () => {} };
+    adapter.recoveryGatewayBootId = 'new-boot'; adapter.recoveryGatewayProcessPid = 5678;
+  });
+  const probe = vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); });
+  try {
+    expect(await adapter.querySessionRecovery('task', undefined, 1234)).toMatchObject({ gatewayProcessPid: 5678, previousWriterStopped: true });
+    expect(adapter.ensureGatewayClientReady).toHaveBeenCalledOnce(); expect(probe).toHaveBeenCalledWith(1234, 0);
+    probe.mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    expect(await adapter.querySessionRecovery('task', undefined, 1234)).toMatchObject({ previousWriterStopped: false });
+    probe.mockClear();
+    expect(await adapter.querySessionRecovery('task', undefined, 5678)).toMatchObject({ previousWriterStopped: false });
+    expect(probe).not.toHaveBeenCalled();
+  } finally { probe.mockRestore(); }
+});
+
+test('a recovery snapshot from a replaced gateway connection is ignored', async () => {
+  const adapter = new OpenClawRuntimeAdapter({} as never, { getGatewayProcessPid: () => 5678 } as never);
+  adapter.resolveInteractiveSessionKey = () => 'key'; adapter.ensureGatewayClientReady = async () => {};
+  adapter.recoveryGatewayBootId = 'boot'; adapter.recoveryGatewayProcessPid = 5678;
+  adapter.gatewayClient = { start: () => {}, stop: () => {}, request: async () => {
+    adapter.gatewayClient = null; return { sessions: [{ key: 'key', hasActiveRun: false }] };
+  } };
+  expect(await adapter.querySessionRecovery('task')).toBeNull();
+});
+
+
+test('configuration fence records the actual writer after readiness changes the gateway process', async () => {
+  const adapter = new OpenClawRuntimeAdapter({ getSession: () => ({ id: 's', agentId: 'main', modelOverride: 'provider/old' }) } as never,
+    { getGatewayProcessPid: () => 5678 } as never);
+  adapter.store.remote.put('inputFence:s', { operationId: 'patch', gatewayProcessPid: 1234, gatewayBootId: 'old' });
+  adapter.resolveInteractiveSessionKey = () => 'key'; adapter.normalizeModelRef = (value: string) => value;
+  const request = vi.fn(async () => { throw new Error('lost ACK'); });
+  adapter.ensureGatewayClientReady = async () => {
+    adapter.gatewayClient = { request, start: () => {}, stop: () => {} };
+    adapter.recoveryGatewayProcessPid = 5678; adapter.recoveryGatewayBootId = 'new';
+  };
+  await expect(adapter.patchSession('s', { model: 'provider/new' })).rejects.toThrow('lost ACK');
+  expect(adapter.store.remote.get('inputFence:s')).toMatchObject({ operationId: 'patch', gatewayProcessPid: 5678, gatewayBootId: 'new' });
+  expect(request).toHaveBeenCalledOnce();
+});
+
+test('configuration dispatch rejects an old client when the managed gateway process has changed', async () => {
+  const adapter = new OpenClawRuntimeAdapter({} as never, { getGatewayProcessPid: () => 5678 } as never);
+  adapter.store.remote.put('inputFence:s', { operationId: 'patch', gatewayProcessPid: null });
+  const request = vi.fn(); adapter.gatewayClient = { request, start: () => {}, stop: () => {} };
+  adapter.recoveryGatewayProcessPid = 1234;
+  await expect(adapter.requestSessionPatchWithProfile({ sessionId: 's', sessionKey: 'key', patch: { model: 'provider/new' },
+    source: 'test', reason: 'test', inputFenceOperationId: 'patch' })).rejects.toThrow('writer changed');
+  expect(request).not.toHaveBeenCalled();
+  expect(adapter.store.remote.get('inputFence:s')).toMatchObject({ gatewayProcessPid: null });
 });

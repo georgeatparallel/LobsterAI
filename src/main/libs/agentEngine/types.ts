@@ -150,6 +150,17 @@ export interface CoworkSessionPatchResult {
   thinkingLevel?: string;
 }
 
+export interface CoworkSessionRecoverySnapshot {
+  gatewayBootId: string;
+  gatewayProcessPid?: number;
+  previousWriterStopped?: boolean;
+  sessionKey: string;
+  runId?: string;
+  hasActiveRun?: boolean;
+  status: 'unknown' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  configuration?: { modelOverride: string; thinkingLevel: string };
+}
+
 export interface CoworkRuntime {
   on<U extends keyof CoworkRuntimeEvents>(
     event: U,
@@ -166,6 +177,10 @@ export interface CoworkRuntime {
   submitSteer?(sessionId: string, text: string, clientSteerId: string): Promise<CoworkSteerResponse>;
   runGoalCommand?(sessionId: string, command: string): Promise<CoworkGoal | null>;
   patchSession?(sessionId: string, patch: OpenClawSessionPatch): Promise<CoworkSessionPatchResult | void>;
+  getRecoveryGatewayBootId?(): string;
+  getRecoveryGatewayProcessPid?(): number | undefined;
+  querySessionRecovery?(sessionId: string, gatewayRunId?: string, writerPid?: number): Promise<CoworkSessionRecoverySnapshot | null>;
+  restoreSessionObservation?(sessionId: string, remoteRunId: string, snapshot: CoworkSessionRecoverySnapshot): boolean;
   getContextUsage?(sessionId: string): Promise<CoworkContextUsage | null>;
   compactContext?(sessionId: string): Promise<{ compacted: boolean; reason?: string; usage?: CoworkContextUsage | null }>;
   getForkCompactionSummary?(sessionId: string, beforeCreatedAt?: number): Promise<CoworkForkCompactionSummary | null>;
