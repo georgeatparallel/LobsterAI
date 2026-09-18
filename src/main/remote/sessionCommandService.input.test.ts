@@ -5,7 +5,7 @@ import { tmpdir } from 'os';
 import path from 'path';
 import { afterEach, expect, it, vi } from 'vitest';
 
-import { RemoteInputReason, type RemoteResolvedInput } from '../../shared/remote/input';
+import { RemoteInputOperationPhase, RemoteInputReason, type RemoteResolvedInput } from '../../shared/remote/input';
 import type { CoworkStore } from '../coworkStore';
 import type { CoworkRuntime } from '../libs/agentEngine/types';
 import { payloadHash } from './canonical';
@@ -90,9 +90,12 @@ it('publishes a confirmed model change even when the send expires during patch',
 });
 it('retains a durable fence for an unknown model patch instead of unlocking on timeout', async () => {
   const { service, entry, runtime, remote, send } = fixture();
-  runtime.patchSession.mockRejectedValue(new Error('transport result unknown'));
+  runtime.patchSession.mockImplementation(async () => {
+    remote.put('inputFence:local', { ...remote.get<Record<string, unknown>>('inputFence:local'), phase: RemoteInputOperationPhase.Dispatched, gatewayProcessPid: 1234 });
+    throw new Error('transport result unknown');
+  });
   await expect(service.execute(entry, () => true)).rejects.toThrow('transport result unknown');
-  expect(remote.get('inputFence:local')).toMatchObject({ operationId: 'cmd', phase: 'model_applying' });
+  expect(remote.get('inputFence:local')).toMatchObject({ operationId: 'cmd', phase: RemoteInputOperationPhase.Dispatched });
   remote.updateRun('local', 'failed');
   await expect(service.patchConfiguration('local', { model: 'provider/other' })).rejects.toMatchObject({ reason: RemoteInputReason.Busy });
   expect(send).not.toHaveBeenCalled();

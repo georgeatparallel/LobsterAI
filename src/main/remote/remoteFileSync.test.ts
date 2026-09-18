@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { createHash, randomUUID } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -22,7 +23,7 @@ const policy: RemoteFilePolicy = { policyVersion: '1', features: { inputUpload: 
   limits: { partBytes: '4194304', maxInputCount: 10, maxInputBytes: '104857600', maxImageBytes: '20971520', maxTaskArtifactCount: 20, maxTaskArtifactBytes: '209715200' } };
 function folder(): string { const result = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-files-test-')); disposable.push(() => fs.rmSync(result, { recursive: true, force: true })); return result; }
 const ok = (data: unknown): Response => new Response(JSON.stringify({ code: 0, data }));
-function fixture() {
+function fixture(sealedProducer = true) {
   const directory = folder(), source = path.join(directory, 'report.md'), cache = path.join(directory, 'cache'); fs.writeFileSync(source, 'first');
   const db = new Database(':memory:'); disposable.push(() => db.close());
   db.exec(`CREATE TABLE cowork_sessions(id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,status TEXT,model_override TEXT,thinking_level TEXT);
@@ -77,7 +78,16 @@ function fixture() {
     throw new Error(`Unexpected ${pathname}`);
   });
   const deps = { store, cacheRoot: cache, owner: () => actor, environment: () => connection().environment, enabled: () => true,
-    access: () => ({ assertAllowed: () => { if (actor !== owner) throw new Error('hidden'); } }), request };
+    access: () => ({ assertAllowed: () => { if (actor !== owner) throw new Error('hidden'); } }), request,
+    // Simulates an engine that already sealed bytes before reporting its terminal event.
+    terminalSnapshot: sealedProducer ? (item: { run_id: string; id: string }) => {
+      const directory = remoteFileCacheDirectory(cache, owner); fs.mkdirSync(directory, { recursive: true });
+      const target = path.join(directory, randomUUID()); fs.copyFileSync(source, target);
+      const file = fs.statSync(target), original = fs.statSync(source);
+      const identity = (value: fs.Stats) => `${value.dev}:${value.ino}:${value.size}:${value.mtimeMs}:${value.ctimeMs}`;
+      return { runId: item.run_id, artifactId: item.id, producerRevision: `revision-${item.run_id}`,
+        snapshot: { path: target, sizeBytes: String(file.size), sha256: createHash('sha256').update(fs.readFileSync(target)).digest('hex'), identity: identity(original), cacheIdentity: identity(file) } };
+    } : undefined };
   let sync = new RemoteFileSync(deps); sync.configure(true);
   const ack = (): void => { store.snapshot('s'); db.prepare("UPDATE remote_sync SET device_id='pc',ack_seq=source_seq,needs_snapshot=0 WHERE local_id='s'").run(); };
   const tick = async (): Promise<void> => { ack(); sync.tick(connection()); await sync.settled(); };
@@ -106,36 +116,63 @@ describe('remote files policy and immutable snapshots', () => {
     expect(remoteFileRule(policy, 'archive.zip', '1', false)).toBe(RemoteFileReason.Type);
     expect(remoteFileRule(policy, 'video.mp4', '1', true)).toBe(RemoteFileReason.Type);
   });
-  it('freezes explicit desktop input bytes and retains the original after later edits', async () => {
+  it('uses the immutable image bytes passed to the engine instead of a later mutable file version', async () => {
     const root = folder(), source = path.join(root, 'input.txt'); fs.writeFileSync(source, 'original');
-    const input = await captureDesktopInput({ text: 'read', attachments: [{ path: source, name: 'input.txt', intent: 'file' }] }, undefined,
+    const input = await captureDesktopInput({ text: 'read', attachments: [] }, [{ name: 'input.png', mimeType: 'image/png', base64Data: Buffer.from('original').toString('base64') }],
       { owner, cacheRoot: path.join(root, 'cache'), captureSnapshot: true, fallbackText: 'read', current: () => true, access: () => ({ assertAllowed: () => undefined }) });
     fs.writeFileSync(source, 'modified');
     expect(fs.readFileSync(input!.attachments[0].snapshot!.path, 'utf8')).toBe('original');
   });
-  it('rejects symlinks, per-file excess, and account-cache overflow before upload', () => {
+  it('rejects symlinks, per-file excess, and account-cache overflow before upload', async () => {
     const root = folder(), source = path.join(root, 'a.md'), cache = path.join(root, 'cache'); fs.writeFileSync(source, 'value');
     const link = path.join(root, 'link'); fs.symlinkSync(source, link);
-    expect(() => captureRemoteFileSnapshot(link, cache, owner, 10, () => undefined)).toThrow(RemoteFileReason.Source);
-    expect(() => captureRemoteFileSnapshot(source, cache, owner, 4, () => undefined)).toThrow(RemoteFileReason.Size);
+    await expect(captureRemoteFileSnapshot(link, cache, owner, 10, () => undefined)).rejects.toThrow(RemoteFileReason.Source);
+    await expect(captureRemoteFileSnapshot(source, cache, owner, 4, () => undefined)).rejects.toThrow(RemoteFileReason.Size);
     const bucket = remoteFileCacheDirectory(cache, owner); fs.mkdirSync(bucket, { recursive: true });
     const full = fs.openSync(path.join(bucket, 'full'), 'w'); fs.ftruncateSync(full, 200 * 1024 * 1024); fs.closeSync(full);
-    expect(() => captureRemoteFileSnapshot(source, cache, owner, 10, () => undefined)).toThrow(RemoteFileReason.Final);
+    await expect(captureRemoteFileSnapshot(source, cache, owner, 10, () => undefined)).rejects.toThrow(RemoteFileReason.Final);
+  });
+  it('bounds total private snapshots across accounts without deleting source files', async () => {
+    const root = folder(), cache = path.join(root, 'cache'), source = path.join(root, 'a.md'); fs.writeFileSync(source, 'value');
+    for (let index = 0; index < 6; index++) {
+      const bucket = remoteFileCacheDirectory(cache, { userId: `previous-${index}`, scopeKey: 'personal' }); fs.mkdirSync(bucket, { recursive: true });
+      const descriptor = fs.openSync(path.join(bucket, 'full'), 'w');
+      fs.ftruncateSync(descriptor, 180 * 1024 * 1024); fs.closeSync(descriptor);
+    }
+    await expect(captureRemoteFileSnapshot(source, cache, owner, 10, () => undefined)).rejects.toThrow(RemoteFileReason.Final);
+    expect(fs.readFileSync(source, 'utf8')).toBe('value');
   });
   it('detects snapshot corruption even when size stays unchanged', async () => {
     const root = folder(), source = path.join(root, 'a.md'); fs.writeFileSync(source, 'first');
-    const copy = captureRemoteFileSnapshot(source, path.join(root, 'cache'), owner, 10, () => undefined); fs.writeFileSync(copy.path, 'other');
+    const copy = await captureRemoteFileSnapshot(source, path.join(root, 'cache'), owner, 10, () => undefined); fs.writeFileSync(copy.path, 'other');
     await expect(verifyRemoteFileSnapshot(copy, () => true)).rejects.toThrow(RemoteFileReason.Source);
   });
-  it('counts cached snapshots across spaces of the same account', () => {
+  it('counts cached snapshots across spaces of the same account', async () => {
     const root = folder(), cache = path.join(root, 'cache'), source = path.join(root, 'a.md'); fs.writeFileSync(source, 'value');
     const bucket = remoteFileCacheDirectory(cache, { ...owner, scopeKey: 'team:2' }); fs.mkdirSync(bucket, { recursive: true });
     const descriptor = fs.openSync(path.join(bucket, 'full'), 'w'); fs.ftruncateSync(descriptor, 200 * 1024 * 1024); fs.closeSync(descriptor);
-    expect(() => captureRemoteFileSnapshot(source, cache, owner, 10, () => undefined)).toThrow(RemoteFileReason.Final);
+    await expect(captureRemoteFileSnapshot(source, cache, owner, 10, () => undefined)).rejects.toThrow(RemoteFileReason.Final);
   });
 });
 describe('artifact sync durable boundaries and protocol', () => {
-  it('publishes final bytes, pins the actual run, and projects no local path', async () => {
+  it('does not pin a mutable file as the past terminal version or delay starting the next run', async () => {
+    const f = fixture(false); await f.tick(); f.store.updateRun('s', 'succeeded');
+    expect(f.jobs()[0].queue).toHaveLength(0);
+    expect(f.jobs()[0].reason).toBe(RemoteFileReason.Final);
+    await f.tick();
+    expect(f.bytes.get('asset1')?.toString()).toBe('first');
+    expect(f.references).toHaveLength(0);
+    expect(f.jobs()[0].references.m1.pinned).toBe(false);
+    expect(f.jobs()[0].reason).toBe(RemoteFileReason.Final);
+  });
+  it('never attributes the next run bytes to an uncaptured older run', async () => {
+    const f = fixture(false); await f.tick(); f.store.updateRun('s', 'succeeded');
+    f.nextRun(2, 'second'); await f.tick();
+    expect(f.references).toHaveLength(0);
+    expect(f.jobs()[0].queue.some((item: { runId: string }) => item.runId === 'run1')).toBe(false);
+  });
+
+  it('publishes producer-sealed final bytes, pins the actual run, and projects no local path', async () => {
     const f = fixture(); await f.tick(); f.store.updateRun('s', 'succeeded'); await f.tick();
     expect(f.bytes.get('asset1')?.toString()).toBe('first'); expect(f.references).toMatchObject([{ runId: 'run1', messageId: 'm1', kind: 'terminal', artifactVersion: '1' }]);
     const record = f.store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!;

@@ -43,4 +43,14 @@ describe('remote file policy polling', () => {
     await expect((sync as any).json(connection, '/artifact-operation', {})).rejects.toThrow(RemoteFileReason.Policy);
     await tick(); expect(request).toHaveBeenCalledTimes(3);
   });
+  it('reports unavailable file transport independently and clears it when disabled', async () => {
+    const { sync, request, tick } = fixture();
+    expect(sync.health()).toEqual({ degraded: false, pending: null });
+    request.mockRejectedValueOnce(new Error('private upstream path'));
+    await tick();
+    expect(sync.health()).toEqual({ degraded: true, pending: null });
+    sync.configure(false);
+    expect(sync.health()).toEqual({ degraded: false, pending: null });
+  });
+
 });

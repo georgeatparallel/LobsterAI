@@ -3,7 +3,6 @@ import {
   BuildingOffice2Icon,
   ChartBarIcon,
   ChevronRightIcon,
-  ComputerDesktopIcon,
 } from '@heroicons/react/24/outline';
 import {
   type FocusEvent,
@@ -24,6 +23,7 @@ import type {
   EnterpriseAccountIdentity,
 } from '../../../../shared/enterpriseAccount/types';
 import { getAccountMenuDisplayName } from '../../../components/accountMenuState';
+import RemoteControlIcon from '../../../components/icons/RemoteControlIcon';
 import { authService } from '../../../services/auth';
 import {
   getEnterpriseMemberProfileUrl,
@@ -383,7 +383,7 @@ export const EnterpriseAccountMenu = ({
 
         <div className="py-1">
           {onOpenDeviceManagement && <MenuAction
-            icon={<ComputerDesktopIcon className={actionIconClassName} aria-hidden="true" />}
+            icon={<RemoteControlIcon className={actionIconClassName} />}
             label={i18nService.t('remoteDeviceManagement')}
             onClick={() => { onClose(); onOpenDeviceManagement(); }}
           />}

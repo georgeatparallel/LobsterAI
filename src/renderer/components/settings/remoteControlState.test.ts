@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from 'vitest';
 
-import { RemoteConnectionReason, RemoteConnectionStatus, type RemoteSettingsState } from '../../../shared/remote/constants';
-import { isNewRemoteState, isRemoteOnline, needsRemoteSignIn, normalizeRemoteDeviceName, remoteConnectionDescription, remoteConnectionFailure, remoteOwnerKey, remoteSettingsSwitchChecked, toggleRemoteSettingsSwitch } from './remoteControlState';
+import { RemoteConnectionReason, RemoteConnectionStatus, type RemoteSettingsState, RemoteSyncHealthReason, RemoteSyncHealthStatus, RemoteSyncStatus } from '../../../shared/remote/constants';
+import { isNewRemoteState, isRemoteOnline, needsRemoteSignIn, normalizeRemoteDeviceName, remoteAttention, remoteConnectionDescription, remoteConnectionFailure, remoteOwnerKey, remoteSettingsSwitchChecked, remoteSyncDescription, toggleRemoteSettingsSwitch } from './remoteControlState';
 
 const connected: RemoteSettingsState = {
   enabled: true, connected: true, name: 'Computer', owner: { userId: 'user-a', scopeKey: 'personal' },
@@ -16,6 +16,15 @@ describe('remote settings state boundaries', () => {
     expect(isRemoteOnline({ ...connected, connected: false })).toBe(false);
     expect(isRemoteOnline({ ...connected, connectionStatus: RemoteConnectionStatus.Offline })).toBe(false);
     expect(isRemoteOnline(null)).toBe(false);
+  });
+
+  test('quota waiting and explicit removal override a stale connected flag without generic failures', () => {
+    for (const reason of [RemoteConnectionReason.QuotaBlocked, RemoteConnectionReason.Removed]) {
+      const paused = { ...connected, connectionReason: reason };
+      expect(isRemoteOnline(paused)).toBe(false);
+      expect(remoteConnectionFailure(paused)).toBeNull();
+      expect(remoteConnectionDescription(paused)).toBe(reason === RemoteConnectionReason.Removed ? 'remoteConnectionRemoved' : 'remoteWaitingForConnection');
+    }
   });
 
   test('a delayed initial read cannot restore an old account after a newer sign-out event', () => {
@@ -37,7 +46,7 @@ describe('remote settings state boundaries', () => {
     expect(remoteConnectionDescription({ ...offline, connectionReason: RemoteConnectionReason.Connecting })).toBe('remoteConnecting');
     expect(remoteConnectionDescription({ ...offline, connectionReason: RemoteConnectionReason.ServerUpgradeRequired })).toBe('remoteServerUpgradeRequired');
     expect(remoteConnectionDescription({ ...connected, connectionReason: RemoteConnectionReason.WorkspaceUnavailable })).toBe('remoteWorkspaceUnavailable');
-    expect(remoteConnectionDescription({ ...offline, errorCode: 47022 })).toBe('remoteDeviceLimit');
+    expect(remoteConnectionDescription({ ...offline, errorCode: 47022 })).toBe('remoteWaitingForConnection');
     expect(remoteConnectionDescription({ ...offline, errorCode: 47021 })).toBe('remoteRegistrationLimit');
     expect(remoteConnectionDescription({ ...offline, enabled: false, errorCode: 47022 })).toBe('remoteDisabled');
     expect(remoteConnectionDescription({ ...offline, owner: null })).toBe('remoteSignedOut');
@@ -113,6 +122,27 @@ describe('device display names', () => {
 
 
 describe('connection failure feedback', () => {
+  test.each([
+    ['agentCatalogSyncStatus', 'remoteAgentCatalogSyncFailed'],
+    ['sessionSyncStatus', 'remoteSessionSyncFailed'],
+  ] as const)('distinguishes %s failures from an unavailable connection', (field, message) => {
+    const failed = { ...connected, [field]: RemoteSyncStatus.Error };
+    expect(isRemoteOnline(failed)).toBe(true);
+    expect(remoteConnectionFailure(failed)).toBe(message);
+    expect(remoteConnectionFailure({ ...failed, [field]: RemoteSyncStatus.Synced })).toBeNull();
+    expect(remoteConnectionFailure({ ...failed, enabled: false })).toBeNull();
+    expect(remoteConnectionFailure({ ...failed, owner: null })).toBeNull();
+  });
+
+  test('connection and authentication failures take precedence over synchronization failures', () => {
+    const failed = { ...connected, connected: false, agentCatalogSyncStatus: RemoteSyncStatus.Error,
+      sessionSyncStatus: RemoteSyncStatus.Error };
+    expect(remoteConnectionFailure({ ...failed, errorCode: 401 })).toBe('remoteLoginExpired');
+    expect(remoteConnectionFailure({ ...failed, errorCode: 47013 })).toBe('remoteCredentialInvalid');
+    expect(remoteConnectionFailure({ ...failed, error: 'private network details' })).toBe('remoteUnavailable');
+    expect(remoteConnectionFailure({ ...failed, connectionReason: RemoteConnectionReason.ServerUnavailable })).toBe('remoteUnavailable');
+  });
+
   test('credential failure wins over a reconnecting label and never exposes raw server data', () => {
     const failed = { ...connected, connected: false, errorCode: 47013, connectionReason: RemoteConnectionReason.Reconnecting, error: 'private device credential' };
     expect(remoteConnectionDescription(failed)).toBe('remoteCredentialInvalid');
@@ -129,5 +159,35 @@ describe('connection failure feedback', () => {
     expect(remoteConnectionFailure(connected)).toBeNull();
     expect(remoteConnectionFailure({ ...offline, enabled: false, errorCode: 47013 })).toBeNull();
     expect(remoteConnectionDescription({ ...offline, connectionReason: undefined })).toBe('remoteOffline');
+  });
+});
+
+describe('connection and content health remain independent', () => {
+  const health = { status: RemoteSyncHealthStatus.Degraded, reason: RemoteSyncHealthReason.Files,
+    pendingSessions: 1, oldestPendingAt: null, lastSuccessfulSyncAt: null, observedAt: '2026-09-18T00:00:00Z' };
+  test('file-only degradation does not turn a live connection or the preference off', () => {
+    const state = { ...connected, syncHealth: health };
+    expect(isRemoteOnline(state)).toBe(true);
+    expect(remoteSettingsSwitchChecked(state, 'enabled')).toBe(true);
+    expect(remoteSyncDescription(state)).toBe('remoteFilesPending');
+    expect(remoteAttention(state)).toEqual({ key: 'remoteFilesPending', immediate: false });
+  });
+  test('new clients distinguish backlog and cache recovery; old clients do not claim full sync', () => {
+    expect(remoteSyncDescription(connected)).toBeNull();
+    expect(remoteSyncDescription({ ...connected, syncHealth: { ...health, status: RemoteSyncHealthStatus.Syncing } })).toBe('remoteContentSyncing');
+    expect(remoteSyncDescription({ ...connected, syncHealth: { ...health, status: RemoteSyncHealthStatus.Recovering } })).toBe('remoteSyncRecovering');
+    expect(remoteSyncDescription({ ...connected, sessionSyncStatus: RemoteSyncStatus.Pending })).toBe('remoteContentSyncing');
+  });
+  test('quota and removal require immediate action; normal sync does not add an alert', () => {
+    expect(remoteAttention({ ...connected, errorCode: 47022 })).toEqual({ key: 'remoteQuotaAttention', immediate: true });
+    expect(remoteAttention({ ...connected, connectionReason: RemoteConnectionReason.Removed })).toEqual({ key: 'remoteRemovedAttention', immediate: true });
+    expect(remoteAttention({ ...connected, sessionSyncStatus: RemoteSyncStatus.Pending })).toBeNull();
+    expect(remoteAttention({ ...connected, connected: false })).toEqual({ key: 'remoteConnectionAttention', immediate: false });
+  });
+  test('disabled and signed-out states hide previous identity health', () => {
+    for (const state of [{ ...connected, owner: null, syncHealth: health }, { ...connected, enabled: false, syncHealth: health }]) {
+      expect(remoteSyncDescription(state)).toBeNull();
+      expect(remoteAttention(state)).toBeNull();
+    }
   });
 });

@@ -2,6 +2,7 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
+import { type RemoteConnectionsSnapshot, RemoteDeviceAdmissionState, RemoteDeviceConnectionState } from '../../../shared/remote/connections';
 import { RemoteConnectionReason, RemoteConnectionStatus, type RemoteSettingsState, RemoteSyncStatus } from '../../../shared/remote/constants';
 import { i18nService } from '../../services/i18n';
 import RemoteDeviceSettings from './RemoteDeviceSettings';
@@ -10,6 +11,8 @@ const harness = vi.hoisted(() => ({
   snapshot: { state: null as RemoteSettingsState | null, busy: false, error: null as string | null },
   submit: vi.fn(async () => true),
   refresh: vi.fn(async () => undefined),
+  management: { accountEpoch: null as string | null, data: null as RemoteConnectionsSnapshot | null, loading: false, error: null as string | null, operations: {} },
+  resume: vi.fn(async () => true),
   buttons: [] as React.ButtonHTMLAttributes<HTMLButtonElement>[],
 }));
 vi.mock('../../services/remoteSettings', () => ({ remoteSettingsService: {
@@ -17,6 +20,9 @@ vi.mock('../../services/remoteSettings', () => ({ remoteSettingsService: {
   subscribe: () => () => undefined,
   submit: harness.submit,
   refresh: harness.refresh,
+} }));
+vi.mock('../../services/remoteDeviceConnections', () => ({ remoteDeviceConnectionsService: {
+  getSnapshot: () => harness.management, subscribe: () => () => undefined, refresh: harness.refresh, resume: harness.resume,
 } }));
 vi.mock('react-redux', () => ({ useSelector: () => 1 }));
 vi.mock('react/jsx-dev-runtime', async (importOriginal) => {
@@ -49,7 +55,8 @@ const click = (button: React.ButtonHTMLAttributes<HTMLButtonElement> | undefined
 
 beforeEach(() => {
   harness.snapshot = { state: connected, busy: false, error: null };
-  harness.submit.mockClear(); harness.refresh.mockClear();
+  harness.submit.mockClear(); harness.refresh.mockClear(); harness.resume.mockClear();
+  harness.management = { accountEpoch: null, data: null, loading: false, error: null, operations: {} };
   const logError = console.error;
   vi.spyOn(console, 'error').mockImplementation((message: unknown, ...args: unknown[]) => {
     if (typeof message === 'string' && message.includes('useLayoutEffect does nothing on the server')) return;
@@ -59,14 +66,15 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('current remote device settings', () => {
-  test('shows the current device and identity without duplicating QR or preference switches', () => {
+  test('shows the current device, public QR banner and identity without duplicating preference switches', () => {
     const { html, button } = render();
     expect(html).toContain('Private alias');
-    expect(html).toContain(i18nService.t('remotePersonalAccount'));
+    expect(html).toContain(i18nService.t('remoteCurrentDevice'));
     expect(html).toContain(i18nService.t('remoteOnline'));
-    expect(html).toContain(i18nService.t('remoteDeviceManagementDescription'));
+    expect(html).toContain(i18nService.t('remoteDevicesBannerTitle'));
     expect(html).not.toContain('role="switch"');
-    expect(html).not.toContain(i18nService.t('remoteQrOfficialSite'));
+    expect(html).toContain(i18nService.t('remoteQrOfficialSite'));
+    expect(html).toContain('https://lobsterai.youdao.com/');
     expect(html).not.toContain(i18nService.t('remoteAllowConnection'));
     expect(html).not.toContain('<h2');
     expect(button('remoteRenameDevice')?.disabled).toBe(false);
@@ -99,6 +107,32 @@ describe('current remote device settings', () => {
     expect(html).not.toContain('network stack details');
     click(button('remoteReconnect'));
     expect(harness.submit.mock.calls).toEqual([[{ retry: true }]]);
+  });
+
+  test.each([
+    ['agentCatalogSyncStatus', 'remoteAgentCatalogSyncFailed'],
+    ['sessionSyncStatus', 'remoteSessionSyncFailed'],
+  ] as const)('keeps the device online and offers retry for %s', (field, message) => {
+    harness.snapshot.state = { ...connected, [field]: RemoteSyncStatus.Error, connectionReason: RemoteConnectionReason.Connecting };
+    const { html, button } = render();
+    expect(html).toContain(i18nService.t('remoteOnline'));
+    expect(html).toContain(i18nService.t(message));
+    expect(html).not.toContain(i18nService.t('remoteUnavailable'));
+    expect(button('remoteReconnect')).toBeUndefined();
+    click(button('retry'));
+    expect(harness.submit.mock.calls).toEqual([[{ retry: true }]]);
+  });
+
+  test('disables online synchronization retry while busy and removes it after recovery', () => {
+    harness.snapshot = { state: { ...connected, agentCatalogSyncStatus: RemoteSyncStatus.Error }, busy: true, error: null };
+    const { button } = render();
+    expect(button('retry')?.disabled).toBe(true);
+    click(button('retry'));
+    expect(harness.submit).not.toHaveBeenCalled();
+    harness.snapshot = { state: { ...connected, agentCatalogSyncStatus: RemoteSyncStatus.Synced }, busy: false, error: null };
+    const recovered = render();
+    expect(recovered.html).not.toContain(i18nService.t('remoteAgentCatalogSyncFailed'));
+    expect(recovered.button('retry')).toBeUndefined();
   });
 
   test('does not offer reconnect when remote access is disabled or currently connecting', () => {
@@ -156,12 +190,35 @@ describe('current remote device settings', () => {
     }
   });
 
-  test('requires a trusted epoch for rename and keeps instructions collapsed initially', () => {
+  test('requires a trusted epoch for rename without repeating help in the page body', () => {
     harness.snapshot.state = { ...connected, accountEpoch: undefined };
     const { html, button } = render();
     expect(button('remoteRenameDevice')?.disabled).toBe(true);
-    expect(html).toContain('aria-expanded="false"');
-    expect(html).toContain(i18nService.t('remoteHowItWorks'));
+    expect(html).not.toContain(i18nService.t('remoteHowItWorks'));
     expect(html).not.toContain(i18nService.t('remoteSameIdentityHelp'));
   });
+  test('quota blocked remains visible with paused-sync explanation and no failure alert', () => {
+    harness.snapshot.state = { ...connected, connected: false, deviceConnectionManagementSupported: true,
+      connectionReason: RemoteConnectionReason.QuotaBlocked, errorCode: 47022 };
+    const { html, button } = render();
+    expect(html).toContain('Private alias');
+    expect(html).toContain(i18nService.t('remoteWaitingForConnection'));
+    expect(html).toContain(i18nService.t('remoteLocalTasksUnaffected'));
+    expect(html).not.toContain(i18nService.t('remoteConnectionFailed'));
+    click(button('remoteReconnect'));
+    expect(harness.submit).toHaveBeenCalledWith({ retry: true });
+  });
+
+  test('removed device resumes explicitly rather than retrying the old connection', () => {
+    harness.snapshot.state = { ...connected, connected: false, deviceConnectionManagementSupported: true, connectionReason: RemoteConnectionReason.Removed };
+    const current = { deviceId: 'this', name: 'Private alias', connectionVersion: '2', connectionState: RemoteDeviceConnectionState.Removed, admissionState: RemoteDeviceAdmissionState.Removed, slotOccupied: false };
+    harness.management = { accountEpoch: 'epoch-a', data: { supported: true, observedAt: '', presenceAvailable: true,
+      quota: { maxOnlineDesktops: 5, onlineSlotsUsed: 0, scope: 'account_scope' }, currentDevice: current, connections: [] }, loading: false, error: null, operations: {} };
+    const { html, button } = render();
+    expect(html).toContain(i18nService.t('remoteConnectionRemoved'));
+    click(button('remoteReconnect'));
+    expect(harness.resume).toHaveBeenCalledWith(current, 'epoch-a');
+    expect(harness.submit).not.toHaveBeenCalled();
+  });
+
 });

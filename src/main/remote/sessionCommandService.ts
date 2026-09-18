@@ -7,7 +7,8 @@ import { AgentId, AgentOwnerKind } from '../../shared/agent/constants';
 import type { ApprovalDecisionOutcome, ApprovalState } from '../../shared/cowork/approval';
 import { parseModelThinkingLevel } from '../../shared/providers/modelThinking';
 import type { RemoteOwner } from '../../shared/remote/constants';
-import { RemoteInputReason } from '../../shared/remote/input';
+import { RemoteInputOperationPhase, RemoteInputReason } from '../../shared/remote/input';
+import { type QuestionDecisionOutcome, RemoteQuestion } from '../../shared/remote/questions';
 import type { CoworkStore } from '../coworkStore';
 import { t } from '../i18n';
 import type { CoworkRuntime, PermissionRequest } from '../libs/agentEngine/types';
@@ -17,10 +18,13 @@ import type { InputPreparationService, LocalPreparedInput } from './inputPrepara
 import { RemoteAgentError, remoteAgentFailure } from './remoteAgentCatalog';
 import { RemoteApprovalError } from './remoteApproval';
 import type { InboxEntry, RemoteCommand } from './remoteBridge';
+import { remoteDiagnostics } from './remoteDiagnostics';
 import { RemoteInputError, type RemoteModelCatalog } from './remoteModelCatalog';
+import { RemoteQuestionError } from './remoteQuestionService';
 
 interface ExecutionContext { owner: RemoteOwner | null; preparedSessionId?: string; runId?: string; commandId?: string; stillPermitted?: () => boolean; assertAgentBinding?: () => void }
 const context = new AsyncLocalStorage<ExecutionContext>();
+const inputPreparationProcessId = randomUUID();
 export const currentRemoteExecution = (): ExecutionContext | undefined => context.getStore();
 export const assertRemoteExecutionPermit = (): void => {
   const active = context.getStore();
@@ -35,6 +39,8 @@ export const markRemoteExecutionDispatched = (): void => {
 };
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
 interface InputFence {
+  schemaVersion?: number;
+  preparedProcessId?: string;
   operationId: string;
   phase: string;
   target?: { model?: string | null; thinkingLevel?: string | null };
@@ -67,6 +73,9 @@ export class SessionCommandService {
     this.store.remote.assertActor(sessionId, actor);
     const fence = this.store.remote.get<InputFence>(`inputFence:${sessionId}`);
     const run = this.store.remote.run(sessionId);
+    if (fence && !this.submitting.has(sessionId) && !this.configurationLane.has(sessionId) && this.clearPreparedInput(sessionId, fence.operationId)) {
+      return !run || terminal.has(run.status);
+    }
     if (!fence && run?.status !== 'reconciling') return !run || terminal.has(run.status);
     if (!this.runtime.querySessionRecovery || this.submitting.has(sessionId) || this.configurationLane.has(sessionId)) return false;
     const lane = randomUUID(); this.configurationLane.set(sessionId, lane);
@@ -125,6 +134,20 @@ export class SessionCommandService {
     }
   }
 
+  /** Only a new-format fence written before the real dispatch boundary proves no RPC was sent. */
+  private clearPreparedInput(sessionId: string, operationId: string): boolean {
+    const fence = this.store.remote.get<InputFence>(`inputFence:${sessionId}`);
+    if (fence?.operationId !== operationId || fence.schemaVersion !== 2
+      || fence.phase !== RemoteInputOperationPhase.Prepared || fence.gatewayProcessPid
+      || fence.preparedProcessId !== inputPreparationProcessId) return false;
+    this.store.remote.transaction(() => {
+      this.store.remote.put(`inputOperation:${operationId}`, { phase: RemoteInputOperationPhase.KnownNotApplied });
+      this.store.remote.remove(`inputFence:${sessionId}`);
+    });
+    remoteDiagnostics.record('fence.released');
+    return true;
+  }
+
   private input: { preparations: InputPreparationService; models: RemoteModelCatalog; getDeviceId(): string | undefined } | null = null;
   configureInput(input: NonNullable<SessionCommandService['input']>): void { this.input = input; }
   recordCurrentInputModel(sessionId: string): Record<string, unknown> | null {
@@ -172,7 +195,7 @@ export class SessionCommandService {
     };
     try {
       check(); this.store.remote.inputVersion(sessionId);
-      this.store.remote.put(`inputFence:${sessionId}`, { operationId: token, phase: 'model_applying', target: patch, gatewayBootId: '', gatewayProcessPid: null });
+      this.store.remote.put(`inputFence:${sessionId}`, { schemaVersion: 2, preparedProcessId: inputPreparationProcessId, operationId: token, phase: RemoteInputOperationPhase.Prepared, target: patch, gatewayBootId: '', gatewayProcessPid: null });
       const result = await this.runtime.patchSession(sessionId, patch);
       check();
       this.store.updateSession(sessionId, {
@@ -181,6 +204,13 @@ export class SessionCommandService {
       }, { touchUpdatedAt: false });
       this.store.remote.inputVersion(sessionId); this.recordCurrentInputModel(sessionId); this.store.remote.remove(`inputFence:${sessionId}`);
       return result;
+    } catch (error) {
+      // Never infer rejection from a timeout. A dispatched/legacy fence retains the recovery barrier.
+      if (generation === this.ownershipOptions.getGeneration?.() && (actor ? sameOwner(actor, this.getOwner()) : this.getOwner() === null)) {
+        this.store.remote.assertActor(sessionId, actor);
+        this.clearPreparedInput(sessionId, token);
+      }
+      throw error;
     } finally { this.configurationLane.delete(sessionId); }
   }
   private startHandler: ((options: any) => Promise<any>) | null = null;
@@ -326,7 +356,7 @@ export class SessionCommandService {
       if (!command.runId) throw new Error('Server run mapping is required');
       runId = this.store.remote.beginRun(localId, command.runId, command.commandId).runId;
     }
-    if (['cancel_run', 'approval_response'].includes(command.type) && payload.runId !== runId) throw new Error('Run changed');
+    if (['cancel_run', 'approval_response', RemoteQuestion.Command].includes(command.type) && payload.runId !== runId) throw new Error('Run changed');
     return { localSessionId: localId, remoteSessionId: this.store.remote.sync(localId)!.session_id, runId };
   }
   async execute(entry: InboxEntry, stillPermitted: () => boolean = () => false): Promise<any> {
@@ -374,7 +404,7 @@ export class SessionCommandService {
           const beforeVersion = this.store.remote.inputVersion(localId);
           if (entry.command.type === 'send_message' && request.expectedInputVersion !== beforeVersion) throw new RemoteInputError(RemoteInputReason.Version);
           if (entry.command.type === 'send_message') {
-            this.store.remote.put(`inputFence:${localId}`, { operationId: entry.command.commandId, phase: 'model_applying', beforeVersion, remoteRunId: entry.runId,
+            this.store.remote.put(`inputFence:${localId}`, { schemaVersion: 2, preparedProcessId: inputPreparationProcessId, operationId: entry.command.commandId, phase: RemoteInputOperationPhase.Prepared, beforeVersion, remoteRunId: entry.runId,
               target: { model: options.modelOverride, thinkingLevel: options.thinkingLevel || null }, gatewayBootId: '', gatewayProcessPid: null });
             await this.runtime.patchSession(localId, { model: options.modelOverride, thinkingLevel: options.thinkingLevel || null });
             // A confirmed patch remains a fact even if the send permit expires during the await.
@@ -397,6 +427,12 @@ export class SessionCommandService {
             : await this.continueHandler!({ ...options, sessionId: localId });
           if (!submitted?.success) throw new RemoteInputError(RemoteInputReason.Invalid);
           return submitted;
+        } catch (error) {
+          if (sameOwner(entry.owner, this.getOwner())) {
+            this.store.remote.assertActor(localId, entry.owner);
+            this.clearPreparedInput(localId, entry.command.commandId);
+          }
+          throw error;
         } finally { this.configurationLane.delete(localId); }
       }
       if (entry.command.type === 'create_session') return this.startHandler!({ prompt: payload.text, cwd: fixedCwd, agentId: fixedAgentId });
@@ -410,6 +446,30 @@ export class SessionCommandService {
         this.store.remote.updateRun(localId, 'cancelling');
         const confirmed = await this.runtime.cancelSessionConfirmed(localId);
         if (this.store.remote.run(localId)?.runId === entry.runId) this.store.remote.updateRun(localId, confirmed ? 'cancelled' : 'reconciling');
+        return { success: true };
+      }
+      if (entry.command.type === RemoteQuestion.Command) {
+        const state = this.runtime.getQuestionState?.(payload.questionId);
+        if (!['answer', 'cancel'].includes(payload.action) || !state || state.sessionId !== localId
+          || state.runId !== entry.runId || !this.runtime.respondToQuestionConfirmed) {
+          throw new RemoteQuestionError({ kind: 'known_not_applied', reason: 'QUESTION_STALE' });
+        }
+        const outcome = await this.runtime.respondToQuestionConfirmed(payload.questionId, payload.action === 'answer'
+          ? { behavior: 'allow', updatedInput: { answers: payload.answers } } : { behavior: 'deny', message: 'Cancelled from mobile' }, {
+          submissionId: entry.command.commandId, source: 'mobile', expectedVersion: payload.questionVersion,
+          operationDigest: payload.operationDigest, onDispatch: markRemoteExecutionDispatched,
+          beforeDispatch: () => {
+            assertRemoteExecutionPermit();
+            this.store.remote.assertActor(localId, entry.owner);
+            if (!sameOwner(this.getOwner(), entry.owner) || !sameOwner(this.store.remote.owner(localId), entry.owner)
+              || this.store.remote.run(localId)?.runId !== entry.runId) throw new Error('Question owner or run changed');
+            const current = this.store.getSession(localId, 0);
+            if (!current || current.agentId !== session?.agentId || current.cwd !== session?.cwd) throw new Error('Question binding changed');
+            this.store.assertAgentAccess(current.agentId || AgentId.Main, entry.owner);
+          },
+        });
+        if (!outcome || outcome.kind !== 'confirmed') throw new RemoteQuestionError(outcome || { kind: 'unknown', reason: 'QUESTION_RESULT_UNKNOWN' });
+        if (outcome.status !== (payload.action === 'answer' ? 'answered' : 'cancelled')) throw new RemoteQuestionError({ kind: 'unknown', reason: 'QUESTION_RESULT_UNKNOWN' });
         return { success: true };
       }
       if (entry.command.type === 'approval_response') {
@@ -441,10 +501,15 @@ export class SessionCommandService {
     });
     if (!result?.success) throw bindingFailure || new Error(result?.error || 'Task submission failed');
     return { outcome: ['create_session', 'send_message'].includes(entry.command.type) ? 'started'
-      : entry.command.type === 'cancel_run' ? (result.alreadyTerminal ? 'already_terminal' : 'cancel_requested') : 'approval_applied' };
+      : entry.command.type === 'cancel_run' ? (result.alreadyTerminal ? 'already_terminal' : 'cancel_requested')
+      : entry.command.type === RemoteQuestion.Command ? 'question_applied' : 'approval_applied' };
     } finally { release(); }
   }
   private permission(sessionId: string, request: PermissionRequest): void {
+    if (this.runtime.getQuestionState?.(request.requestId)?.sessionId === sessionId) {
+      this.store.remote.updateLocalApprovalBlocker(sessionId, request.requestId, null, false);
+      return; // The question authority owns its projection and waiting state.
+    }
     const state = request.approval || this.runtime.getPermissionState?.(request.requestId);
     if (state) this.permissionState(sessionId, state);
     else {
@@ -485,6 +550,23 @@ export class SessionCommandService {
       return { kind: 'known_not_applied', reason: 'NEVER_DISPATCHED' };
     }
     return outcome;
+  }
+  async reconcileQuestion(entry: InboxEntry): Promise<QuestionDecisionOutcome | null> {
+    if (entry.command.type !== RemoteQuestion.Command || !entry.localSessionId) return null;
+    const outcome = await this.runtime.reconcileQuestionSubmission?.(entry.command.commandId) || null;
+    if (outcome) return outcome;
+    const persisted = this.store.remote.get<InboxEntry>(`inbox:${entry.command.commandId}`);
+    // Only this exact durable prepared inbox proves that the authority was never invoked.
+    // An executing marker, lost claim token, or missing history must remain unknown.
+    if (persisted?.state === 'prepared' && entry.command.claimId && entry.command.claimToken
+      && payloadHash(entry.command.request) === entry.command.requestHash
+      && persisted.command.requestHash === entry.command.requestHash
+      && persisted.command.claimId === entry.command.claimId && persisted.command.claimToken === entry.command.claimToken
+      && persisted.localSessionId === entry.localSessionId && persisted.runId === entry.runId
+      && sameOwner(persisted.owner, entry.owner) && this.store.remote.hasCompleteExecutionHistory()) {
+      return { kind: 'known_not_applied', reason: 'NEVER_DISPATCHED' };
+    }
+    return null;
   }
   accountChanged(previous: RemoteOwner | null, current: RemoteOwner | null): void {
     if (!previous || sameOwner(previous, current)) return;

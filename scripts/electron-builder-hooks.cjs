@@ -703,6 +703,15 @@ function writeWindowsPayloadSizeFragment(context) {
 }
 
 async function beforePack(context) {
+  // Worker threads load real, unpacked files; never ship a main-only compilation.
+  const workerFiles = require('../electron-builder.json').asarUnpack
+    .filter(file => /^dist-electron\/remote.+Worker\.(?:js|cjs)$/.test(file));
+  const appDirectory = context.appDir || context.packager.info.appDir || path.resolve(__dirname, '..');
+  for (const file of workerFiles) {
+    if (!existsSync(path.join(appDirectory, file))) {
+      throw new Error(`[electron-builder-hooks] Missing remote worker ${file}; run npm run build before packaging.`);
+    }
+  }
   configureBetterSqlite3MacPayload(context);
   ensureBundledOpenClawRuntime(context);
   // Install skill dependencies first (for all platforms)

@@ -1,5 +1,8 @@
+import { randomUUID } from 'crypto';
+
 import type { ApprovalDecisionOutcome } from '../shared/cowork/approval';
 import { OpenClawQuestion } from '../shared/cowork/openclawQuestion';
+import type { QuestionDecisionOutcome } from '../shared/remote/questions';
 import type { CoworkRuntime, PermissionResult } from './libs/agentEngine/types';
 
 export interface CoworkPermissionSubmission {
@@ -23,13 +26,14 @@ interface PermissionIpcDependencies {
 export async function submitCoworkPermission(
   request: CoworkPermissionSubmission,
   deps: PermissionIpcDependencies,
-): Promise<ApprovalDecisionOutcome | { kind: 'question_resolved' }> {
+): Promise<ApprovalDecisionOutcome | QuestionDecisionOutcome | { kind: 'question_resolved' }> {
   if (!request || typeof request.requestId !== 'string' || !request.requestId
     || !request.result || !['allow', 'deny'].includes(request.result.behavior)) {
     throw new Error('INVALID_PERMISSION_RESPONSE');
   }
   const snapshot = deps.runtime.getPermissionState?.(request.requestId);
-  const sessionId = snapshot?.sessionId ?? deps.sessionForRequest(request.requestId);
+  const question = deps.runtime.getQuestionState?.(request.requestId);
+  const sessionId = question?.sessionId ?? snapshot?.sessionId ?? deps.sessionForRequest(request.requestId);
   const accountKey = deps.accountKey();
   const assertAccess = (): void => {
     if (!sessionId || !deps.canAccessSession(sessionId) || deps.accountKey() !== accountKey) {
@@ -38,6 +42,13 @@ export async function submitCoworkPermission(
   };
   assertAccess();
 
+  if (question) {
+    if (!deps.runtime.respondToQuestionConfirmed) throw new Error('QUESTION_UNAVAILABLE');
+    const result = await deps.runtime.respondToQuestionConfirmed(request.requestId, request.result, {
+      submissionId: request.submissionId || randomUUID(), source: 'desktop', beforeDispatch: assertAccess,
+    });
+    assertAccess(); return result;
+  }
   if (request.requestId.startsWith(OpenClawQuestion.RequestIdPrefix)) {
     await deps.runtime.respondToPermission(request.requestId, request.result);
     assertAccess();

@@ -1,4 +1,4 @@
-import { ArrowPathIcon, ChevronRightIcon, ComputerDesktopIcon } from '@heroicons/react/24/outline';
+import { ArrowPathIcon, ChevronRightIcon } from '@heroicons/react/24/outline';
 import React, {
   useCallback,
   useEffect,
@@ -41,6 +41,7 @@ import { ACCOUNT_MENU_COMPACT_CTA_CLASS_NAME } from './accountMenuStyles';
 import CreditsFinalRewardModal from './CreditsFinalRewardModal';
 import { DailyCheckInAccountMenuEntry } from './DailyCheckInActivity';
 import { getDailyCheckInAuthScopeKey } from './dailyCheckInActivityState';
+import RemoteControlIcon from './icons/RemoteControlIcon';
 import UserAvatarIcon from './icons/UserAvatarIcon';
 import {
   type StartupCreditCampaignEntry,
@@ -610,16 +611,13 @@ const UserMenu: React.FC<UserMenuProps> = ({
         />
       </div>
 
-      {onOpenDeviceManagement && <div className="border-b border-border py-1">
-        <AccountMenuAction
-          icon={<ComputerDesktopIcon className="h-4 w-4 shrink-0 text-secondary" aria-hidden="true" />}
+      {/* Device management, campaigns and invitations */}
+      <div className="border-b border-border py-1">
+        {onOpenDeviceManagement && <AccountMenuAction
+          icon={<RemoteControlIcon className="h-4 w-4 shrink-0 text-secondary" />}
           label={i18nService.t('remoteDeviceManagement')}
           onClick={() => { onClose(); onOpenDeviceManagement(); }}
-        />
-      </div>}
-
-      {/* Campaigns and invitations */}
-      <div className="border-b border-border py-1">
+        />}
         {campaignActionLabel && (
           <AccountMenuAction
             icon={<PortalMenuIcon src={promoSubscriptionIconUrl} darkInvert />}

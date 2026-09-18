@@ -4,6 +4,8 @@ import { CoworkIpcChannel } from '../../shared/cowork/constants';
 import { submitCoworkPermission } from '../coworkPermissionIpc';
 import type { CoworkRuntime, PermissionResult } from '../libs/agentEngine/types';
 import { type AskUserResponse, AskUserResponseReason, McpBridgeServer } from '../libs/mcpBridgeServer';
+import { RemoteQuestionService } from '../remote/remoteQuestionService';
+import type { RemoteStore } from '../remote/remoteStore';
 import type { SqliteStore } from '../sqliteStore';
 import { McpRuntime } from './mcpRuntime';
 
@@ -40,16 +42,19 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function fixture() {
+async function fixture(authority = false) {
   const permissionSessions = new Map<string, string>();
   const requested = vi.fn();
   const dismissed = vi.fn();
+  const registered = vi.fn().mockReturnValue({});
+  const settled = vi.fn();
   const runtime = new McpRuntime({
     permissionSessions,
     getStore: () => ({ getDatabase: () => ({}) }) as unknown as SqliteStore,
     syncOpenClawConfig: vi.fn(),
     onAskUserRequested: requested,
     onAskUserDismissed: dismissed,
+    ...(authority ? { registerQuestion: registered, settleQuestion: settled } : {}),
   });
   await runtime.startAskUserServer();
   const deps = {
@@ -66,7 +71,7 @@ async function fixture() {
       if (!runtime.resolveAskUser(id, response)) throw new Error('QUESTION_UNAVAILABLE');
     }),
   };
-  return { runtime, permissionSessions, requested, dismissed, deps };
+  return { runtime, permissionSessions, requested, dismissed, registered, settled, deps };
 }
 
 describe('AskUserQuestion creation to IPC response', () => {
@@ -125,5 +130,111 @@ describe('AskUserQuestion creation to IPC response', () => {
     expect(permissionSessions.size).toBe(0);
     expect(requested).not.toHaveBeenCalled();
     expect(send.mock.calls.some(([channel]) => channel === CoworkIpcChannel.StreamPermission)).toBe(false);
+  });
+});
+
+
+describe('MCP question authority bridge', () => {
+  test('registers the original form and actual lifetime before display; adapts canonical answers once', async () => {
+    vi.setSystemTime(1_000);
+    const { runtime, registered, settled } = await fixture(true);
+    send.mockImplementation(channel => {
+      if (channel === CoworkIpcChannel.StreamPermission) expect(registered).toHaveBeenCalledTimes(1);
+    });
+    const form = [
+      { question: 'Which platforms?', header: 'Targets', multiSelect: true,
+        options: [{ label: 'macOS', description: 'Desktop' }, { label: 'Windows' }] },
+      { question: 'Release label?', options: [] },
+    ];
+    const response = runtime.askUserInternal(form, 10_000, { sessionKey });
+    const registration = registered.mock.calls[0][0];
+    expect(registration).toMatchObject({ kind: 'legacy', sessionId: 'session-a', createdAt: 1_000, expiresAt: 11_000,
+      questions: [{ questionId: 'q_0', question: 'Which platforms?', header: 'Targets', multiSelect: true,
+        isOther: true, allowSkip: true, options: form[0].options },
+      { questionId: 'q_1', question: 'Release label?', allowSkip: true }] });
+    const answer = { q_0: ['macOS', 'Windows'], q_1: ['Preview'] };
+    expect(registration.resolve({ action: 'answer', answers: answer })).toEqual({ kind: 'confirmed', status: 'answered', answers: answer });
+    await expect(response).resolves.toEqual({ behavior: 'allow', answers: { 'Which platforms?': 'macOS|||Windows', 'Release label?': 'Preview' } });
+    expect(settled).toHaveBeenCalledExactlyOnceWith(registration.requestId, { status: 'answered', answers: answer });
+    expect(registration.resolve({ action: 'answer', answers: answer })).toEqual({ kind: 'known_not_applied', reason: 'QUESTION_UNAVAILABLE' });
+    expect(settled).toHaveBeenCalledTimes(1);
+  });
+
+  test('arbitrates competing mobile and desktop answers through the real authority', async () => {
+    const { runtime, registered, settled } = await fixture(true);
+    const rows = new Map<string, string>();
+    const authority = new RemoteQuestionService({
+      get: (key: string) => rows.has(key) ? JSON.parse(rows.get(key)!) : undefined,
+      put: (key: string, value: unknown) => rows.set(key, JSON.stringify(value)),
+      transaction: (operation: () => unknown) => operation(), updateQuestion: () => {},
+    } as unknown as RemoteStore, () => ({ runId: 'run-a', owner: { userId: 'user-a', scopeKey: 'personal' }, agentId: 'main', cwd: '/workspace' }));
+    registered.mockImplementation(input => authority.register(input));
+    settled.mockImplementation((id, result) => authority.settle(id, result));
+    const localResponse = runtime.askUserInternal(questions, 10_000, { sessionKey });
+    const requestId = registered.mock.calls[0][0].requestId;
+    const state = authority.getState(requestId)!;
+    const mobile = authority.submit(state.questionId, { behavior: 'allow', updatedInput: { answers: { q_0: ['Yes'] } } }, {
+      submissionId: 'mobile-submit', source: 'mobile', expectedVersion: state.questionVersion,
+      operationDigest: state.operationDigest, beforeDispatch: () => {},
+    });
+    await expect(authority.submit(requestId, { behavior: 'deny' }, { submissionId: 'desktop-submit', source: 'desktop' }))
+      .resolves.toMatchObject({ kind: 'known_not_applied', reason: 'QUESTION_STALE' });
+    await expect(mobile).resolves.toMatchObject({ kind: 'confirmed', status: 'answered', answers: { q_0: ['Yes'] } });
+    await expect(localResponse).resolves.toEqual({ behavior: 'allow', answers: { 'Continue?': 'Yes' } });
+    expect(settled).toHaveBeenCalledTimes(1);
+    expect(authority.getState(requestId)?.status).toBe('answered');
+  });
+
+  test('does not publish session-agnostic or duplicate legacy keys to remote control', async () => {
+    const { runtime, registered, requested } = await fixture(true);
+    const global = runtime.askUserInternal(questions, 1_000);
+    expect(registered).not.toHaveBeenCalled();
+    runtime.resolveAskUser(requested.mock.calls[0][1].requestId, { behavior: 'deny' });
+    await expect(global).resolves.toEqual({ behavior: 'deny' });
+    const duplicate = runtime.askUserInternal([...questions, ...questions], 1_000, { sessionKey });
+    expect(registered).not.toHaveBeenCalled();
+    runtime.resolveAskUser(requested.mock.calls[1][1].requestId, { behavior: 'deny' });
+    await expect(duplicate).resolves.toEqual({ behavior: 'deny' });
+  });
+
+  test('keeps secret-marked forms local instead of stripping their marker during adaptation', async () => {
+    const { runtime, registered, requested } = await fixture(true);
+    const response = runtime.askUserInternal([{ ...questions[0], isSecret: true } as typeof questions[number]], 1_000, { sessionKey });
+    expect(registered).not.toHaveBeenCalled();
+    runtime.resolveAskUser(requested.mock.calls[0][1].requestId, { behavior: 'deny' });
+    await expect(response).resolves.toEqual({ behavior: 'deny' });
+  });
+
+  test('reports timeout to authority and never calls the old resolver as a second attempt', async () => {
+    const { runtime, registered, settled } = await fixture(true);
+    const response = runtime.askUserInternal(questions, 1_000, { sessionKey });
+    const registration = registered.mock.calls[0][0];
+    await vi.advanceTimersByTimeAsync(1_001);
+    await expect(response).resolves.toMatchObject({ reason: AskUserResponseReason.Timeout });
+    expect(settled).toHaveBeenCalledExactlyOnceWith(registration.requestId, { status: 'expired' });
+    const resolve = vi.spyOn(runtime, 'resolveAskUser');
+    expect(registration.resolve({ action: 'cancel', answers: {} })).toEqual({ kind: 'known_not_applied', reason: 'QUESTION_UNAVAILABLE' });
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps the original local form usable if remote registration fails', async () => {
+    const { runtime, registered, requested, settled } = await fixture(true);
+    registered.mockImplementation(() => { throw new Error('derived database unavailable'); });
+    const response = runtime.askUserInternal(questions, 1_000, { sessionKey });
+    const requestId = requested.mock.calls[0][1].requestId;
+    expect(send).toHaveBeenCalledWith(CoworkIpcChannel.StreamPermission, expect.any(Object));
+    expect(runtime.resolveAskUser(requestId, { behavior: 'allow', answers: { 'Continue?': 'Yes' } })).toBe(true);
+    await expect(response).resolves.toMatchObject({ behavior: 'allow' });
+    expect(settled).not.toHaveBeenCalled();
+  });
+
+  test('returns the actual expiry outcome when an answer races the local deadline', async () => {
+    vi.setSystemTime(1_000);
+    const { runtime, registered } = await fixture(true);
+    const response = runtime.askUserInternal(questions, 1_000, { sessionKey });
+    const registration = registered.mock.calls[0][0];
+    vi.setSystemTime(2_001);
+    expect(registration.resolve({ action: 'answer', answers: { q_0: ['Yes'] } })).toEqual({ kind: 'known_not_applied', status: 'expired', reason: 'QUESTION_UNAVAILABLE' });
+    await expect(response).resolves.toMatchObject({ behavior: 'deny', reason: AskUserResponseReason.Timeout });
   });
 });

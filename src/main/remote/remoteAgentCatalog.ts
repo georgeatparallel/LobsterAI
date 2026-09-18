@@ -11,6 +11,7 @@ import type { RemoteStore } from './remoteStore';
 interface AgentRow { id: string; name: string; icon: string; enabled: number }
 interface WorkspaceBinding { agentId: string; workspaceId: string; path: string; available: boolean }
 interface Publication { publicationId: string; expectedCatalogVersion: string; items: RemoteAgentCatalogItem[] }
+const AGENT_VERSION_CONFLICT = 47029;
 interface CatalogState { catalogVersion: string; syncedHash: string | null; syncedItems?: RemoteAgentCatalogItem[]; pending: Publication | null }
 export interface AgentWorkspace { path: string; name: string; available?: boolean }
 export class RemoteAgentError extends Error {
@@ -72,7 +73,8 @@ export class RemoteAgentCatalog {
       let available = false;
       try { available = Boolean(path && workspace?.available !== false && statSync(path).isDirectory()); } catch { available = false; }
       const stateKey = `agentWorkspaceState:${identity.agentId}`;
-      const fingerprint = payloadHash({ path, available });
+      const defaultInput = this.getDefaultInput?.(owner, deviceId, identity.agentId);
+      const fingerprint = payloadHash({ path, available, defaultInput: defaultInput || null });
       const previous = this.store.get<string>(stateKey);
       const workspaceKey = this.workspaceKey(owner, deviceId, identity.agentId);
       const bindings = this.store.get<WorkspaceBinding[]>(workspaceKey) || [];
@@ -86,7 +88,6 @@ export class RemoteAgentCatalog {
       });
       const summary = this.agentSummary(identity.agentId, owner)!;
       const row = this.row(identity.agentId)!;
-      const defaultInput = this.getDefaultInput?.(owner, deviceId, identity.agentId);
       items.push({ agentId: summary.agentId, name: summary.name, icon: summary.icon, kind: summary.kind as 'default' | 'owned', version: summary.version,
         ...(defaultInput ? { defaultInput } : {}),
         enabled: Boolean(row.enabled), defaultWorkspaceId: binding?.workspaceId || null, workspaceAvailable: available,
@@ -97,7 +98,7 @@ export class RemoteAgentCatalog {
   resolve(owner: RemoteOwner, deviceId: string, agentId: string, version: string, workspaceId: string): string {
     if (!this.ownership.canPublish(agentId, owner)) throw remoteAgentFailure('NOT_SELECTABLE');
     const identity = this.ownership.get(agentId)!;
-    if (identity.version !== version) throw new RemoteAgentError(47029, 'AGENT_VERSION_CONFLICT', 'VERSION_CHANGED');
+    if (identity.version !== version) throw new RemoteAgentError(AGENT_VERSION_CONFLICT, 'AGENT_VERSION_CONFLICT', 'VERSION_CHANGED');
     if (!this.row(agentId)?.enabled) throw remoteAgentFailure('DISABLED');
     const bindings = this.store.get<WorkspaceBinding[]>(this.workspaceKey(owner, deviceId, agentId)) || [];
     const binding = bindings.find(item => item.workspaceId === workspaceId);
@@ -112,6 +113,33 @@ export class RemoteAgentCatalog {
     const identity = this.ownership.get(agentId);
     const item = state.syncedItems.find(value => value.agentId === agentId);
     return this.ownership.canPublish(agentId, owner) && Boolean(item && item.version === identity?.version && item.kind === identity.ownerKind);
+  }
+  private retireRejectedPublication(owner: RemoteOwner, deviceId: string, state: CatalogState,
+    current: { deviceId: string; catalogVersion: string; items: RemoteAgentCatalogItem[] }): void {
+    const pending = state.pending!;
+    if (current.deviceId !== deviceId || current.catalogVersion !== pending.expectedCatalogVersion || !Array.isArray(current.items)) return;
+    const known = new Map(current.items.map(item => [item.agentId, item]));
+    const changed: string[] = [];
+    let versionReused = false;
+    for (const item of pending.items) {
+      const before = known.get(item.agentId);
+      if (!before) continue;
+      const identity = this.ownership.get(item.agentId);
+      // Only repair a reused version. A rollback, changed identity, or lost ownership needs investigation.
+      if (!identity || !this.ownership.canPublish(item.agentId, owner) || identity.ownerKind !== item.kind
+        || before.kind !== item.kind || BigInt(item.version) < BigInt(before.version)
+        || BigInt(identity.version) < BigInt(item.version)) return;
+      if (item.version === before.version && payloadHash(item) !== payloadHash(before)) {
+        versionReused = true;
+        if (identity.version === before.version) changed.push(item.agentId);
+      }
+    }
+    if (!versionReused) return;
+    this.store.transaction(() => {
+      for (const agentId of changed) this.ownership.touch(agentId);
+      // The server explicitly rejected this immutable publication; the next tick builds a new ID and snapshot.
+      this.store.put(this.key(owner, deviceId), { catalogVersion: current.catalogVersion, syncedHash: null, pending: null });
+    });
   }
   async publish(owner: RemoteOwner, deviceId: string, generation: string, api: (path: string, method?: string, body?: unknown) => Promise<any>,
     stillCurrent: () => boolean, limits = { items: REMOTE_AGENT_CATALOG_ITEMS, bytes: REMOTE_AGENT_CATALOG_BYTES },
@@ -141,7 +169,20 @@ export class RemoteAgentCatalog {
     }
     // Pending content is immutable. A different admission context may delay it, never filter/rewrite its ID.
     if (state.pending.items.some(item => !canPublishAgent(item.agentId))) throw new Error('Agent ownership synchronization is waiting for server support');
-    const result = await api(path, 'PUT', { ...state.pending, connectionGeneration: generation });
+    let result;
+    try { result = await api(path, 'PUT', { ...state.pending, connectionGeneration: generation }); }
+    catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === AGENT_VERSION_CONFLICT && stillCurrent()) {
+        const latest = await api(path);
+        if (!stillCurrent()) throw new Error('Account changed');
+        if (latest.deviceId === deviceId && latest.lastPublicationId === state.pending.publicationId) {
+          this.store.put(key, { catalogVersion: latest.catalogVersion, syncedHash: payloadHash(state.pending.items), syncedItems: state.pending.items, pending: null });
+          return;
+        }
+        this.retireRejectedPublication(owner, deviceId, state, latest);
+      }
+      throw error;
+    }
     if (!stillCurrent()) throw new Error('Account changed');
     if (result.publicationId !== state.pending.publicationId || result.deviceId !== deviceId) throw new Error('Agent catalog ACK identity mismatch');
     this.store.put(key, { catalogVersion: result.catalogVersion, syncedHash: payloadHash(state.pending.items), syncedItems: state.pending.items, pending: null });

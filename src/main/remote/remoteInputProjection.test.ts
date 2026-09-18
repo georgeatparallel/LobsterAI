@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { afterEach, expect, it } from 'vitest';
 
+import { RemoteFileReason } from '../../shared/remote/files';
 import { RemoteStore } from './remoteStore';
 
 const owner = { userId: 'A', scopeKey: 'personal' };
@@ -45,4 +46,56 @@ it('does not expose attachment metadata from a different account run', () => {
   userMessage(store);
   const projection = store.snapshot('s');
   expect(JSON.stringify(projection)).not.toContain('private.txt'); expect(store.entries('desktopAsset:')).toHaveLength(0);
+});
+
+it.each([
+  { jobReason: RemoteFileReason.Size, snapshot: true, expected: RemoteFileReason.Size },
+  { jobReason: 'ASSET_MISSING', snapshot: true, expected: 'FILE_MISSING' },
+  { jobReason: 'ASSET_FILE_CHANGED', snapshot: true, expected: RemoteFileReason.Source },
+  { jobReason: 'https://private.example/upload?token=secret', snapshot: true, expected: RemoteFileReason.Transfer },
+  { jobReason: undefined, snapshot: true, expected: RemoteFileReason.Transfer },
+  { jobReason: undefined, snapshot: false, expected: RemoteFileReason.Source },
+])('projects only compatible safe pending input reasons ($jobReason/$snapshot)', ({ jobReason, snapshot, expected }) => {
+  const store = fixture(); store.setFileProjectionSupported(true);
+  store.put('desktopInputRun:run', { owner, text: 'Analyze', attachments: [{ path: '/private/secret/report.txt', fileName: 'report.txt', mimeType: 'text/plain', sizeBytes: '12', intent: 'file', ...(snapshot ? { snapshot: { path: '/private/snapshot/report.txt' } } : {}) }] });
+  userMessage(store);
+  const before = store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!.payload.message;
+  const job = store.get<any>('desktopAsset:m:0');
+  store.put('desktopAsset:m:0', { ...job, ...(jobReason ? { reason: jobReason } : {}) });
+  const message = store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!.payload.message;
+  expect(message.blocks[1]).toMatchObject({ type: 'artifact', availability: 'desktop_only', reason: expected });
+  expect(message.blocks[1]).not.toHaveProperty('assetId');
+  expect(message.blocks[1].artifactId).toBe(before.blocks[1].artifactId);
+  if (expected !== before.blocks[1].reason) expect(BigInt(message.revision)).toBeGreaterThan(BigInt(before.revision));
+  expect(JSON.stringify(message)).not.toContain('/private/');
+  expect(JSON.stringify(message)).not.toContain('token=secret');
+});
+
+it('keeps safe capture failure diagnostics and removes them when an input becomes ready', () => {
+  const store = fixture(); store.setFileProjectionSupported(true);
+  store.put('desktopInputRun:run', { owner, text: 'Analyze', attachments: [{ path: '/private/report.txt', fileName: 'report.txt', mimeType: 'text/plain', sizeBytes: '12', intent: 'file', captureReason: RemoteFileReason.Type }] });
+  userMessage(store);
+  const before = store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!.payload.message;
+  expect(before.blocks[1].reason).toBe(RemoteFileReason.Type);
+  const job = store.get<any>('desktopAsset:m:0');
+  store.put('desktopAsset:m:0', { ...job, reason: RemoteFileReason.Size });
+  expect(store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!.payload.message.blocks[1].reason).toBe(RemoteFileReason.Size);
+  store.put('desktopAsset:m:0', { ...job, availability: 'ready', uploadedAsset: { assetId: 'asset', version: '1', fileName: 'report.txt', mimeType: 'text/plain', sizeBytes: '12', intent: 'file' } });
+  const ready = store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!.payload.message;
+  expect(ready.blocks[1]).toMatchObject({ type: 'attachment', availability: 'ready', assetId: 'asset' });
+  expect(ready.blocks[1]).not.toHaveProperty('reason');
+});
+
+it('does not add reasons to legacy file projections or expose another account capture failure', () => {
+  const store = fixture();
+  store.put('desktopInputRun:run', { owner, text: 'Analyze', attachments: [{ path: '/private/report.txt', fileName: 'report.txt', mimeType: 'text/plain', sizeBytes: '12', intent: 'file', captureReason: RemoteFileReason.Size }] });
+  userMessage(store);
+  const legacy = store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!.payload.message;
+  expect(legacy.blocks[1]).not.toHaveProperty('reason');
+  store.setFileProjectionSupported(true);
+  store.put('desktopInputRun:run', { owner: { userId: 'B', scopeKey: 'personal' }, text: 'private text', attachments: [{ path: '/b', fileName: 'private.txt', captureReason: RemoteFileReason.Size }] });
+  const changed = store.snapshot('s').records.find(row => row.eventType === 'message.upsert')!.payload.message;
+  expect(changed.blocks).toHaveLength(1);
+  expect(JSON.stringify(changed)).not.toContain(RemoteFileReason.Size);
+  expect(JSON.stringify(changed)).not.toContain('private.txt');
 });

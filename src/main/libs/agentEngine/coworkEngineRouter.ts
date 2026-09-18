@@ -11,6 +11,8 @@ import type {
 import type { CoworkGoal } from '../../../shared/cowork/goal';
 import { OpenClawQuestion } from '../../../shared/cowork/openclawQuestion';
 import type { CoworkSteerResponse } from '../../../shared/cowork/steer';
+import type { LocalQuestionState, QuestionAnswers, QuestionDecisionOptions, QuestionDecisionOutcome, QuestionStatus } from '../../../shared/remote/questions';
+import { type QuestionRegistration, RemoteQuestionError } from '../../remote/remoteQuestionService';
 import type {
   CoworkAgentEngine,
   CoworkContextUsage,
@@ -198,6 +200,20 @@ export class CoworkEngineRouter extends EventEmitter implements CoworkRuntime {
     } });
   }
 
+  registerQuestion(input: QuestionRegistration): LocalQuestionState | null { return this.runtime.registerQuestion?.(input) ?? null; }
+  settleQuestion(id: string, result: { status: Exclude<QuestionStatus, 'pending'>; answers?: QuestionAnswers }): void { this.runtime.settleQuestion?.(id, result); }
+  getQuestionState(id: string): LocalQuestionState | null { return this.runtime.getQuestionState?.(id) ?? null; }
+  reconcileQuestionSubmission(id: string): Promise<QuestionDecisionOutcome | null> { return this.runtime.reconcileQuestionSubmission?.(id) ?? Promise.resolve(null); }
+  async respondToQuestionConfirmed(id: string, result: PermissionResult, options?: QuestionDecisionOptions): Promise<QuestionDecisionOutcome> {
+    const state = this.getQuestionState(id);
+    if (!state || !this.runtime.respondToQuestionConfirmed) return { kind: 'known_not_applied', reason: 'QUESTION_UNAVAILABLE' };
+    this.assertSessionAccess(state.sessionId);
+    const actual = options ?? { submissionId: randomUUID(), source: 'desktop' as const };
+    return this.runtime.respondToQuestionConfirmed(id, result, { ...actual, beforeDispatch: async () => {
+      this.assertSessionAccess(state.sessionId); await actual.beforeDispatch?.(); this.assertSessionAccess(state.sessionId);
+    } });
+  }
+
   getPermissionState(id: string): ApprovalState | null { return this.runtime.getPermissionState?.(id) ?? null; }
   getApprovalSubmission(id: string): ApprovalDecisionOutcome | null { return this.runtime.getApprovalSubmission?.(id) ?? null; }
   reconcileApprovalSubmission(id: string, options?: ApprovalReconcileOptions): Promise<ApprovalDecisionOutcome | null> { return this.runtime.reconcileApprovalSubmission?.(id, options) ?? Promise.resolve(null); }
@@ -221,6 +237,9 @@ export class CoworkEngineRouter extends EventEmitter implements CoworkRuntime {
   }
 
   respondToPermission(requestId: string, result: PermissionResult): void | Promise<void> {
+    if (this.getQuestionState(requestId)) return this.respondToQuestionConfirmed(requestId, result).then(outcome => {
+      if (outcome.kind !== 'confirmed') throw new RemoteQuestionError(outcome);
+    });
     if (requestId.startsWith(OpenClawQuestion.RequestIdPrefix)) {
       const sessionId = this.runtime.getPendingQuestions?.()
         .find((question) => question.requestId === requestId)?.sessionId ?? this.requestSession.get(requestId);

@@ -2,13 +2,15 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnershipSyncState, OwnershipTargetKind } from '../../shared/ownership/constants';
-import { RemoteCapability } from '../../shared/remote/constants';
+import { RemoteCapability, RemoteSyncStatus } from '../../shared/remote/constants';
+import { RemoteQuestion } from '../../shared/remote/questions';
 import { RemoteReply } from '../../shared/remote/reply';
 import { OwnershipAssociationStore } from '../ownershipAssociationStore';
 import { payloadHash } from './canonical';
 import { RemoteAgentError } from './remoteAgentCatalog';
 import { RemoteApprovalError } from './remoteApproval';
 import { type InboxEntry, RemoteApiError,RemoteBridge } from './remoteBridge';
+import { RemoteQuestionError } from './remoteQuestionService';
 import { RemoteStore } from './remoteStore';
 
 const owner = { userId: '10001', scopeKey: 'personal' };
@@ -161,7 +163,7 @@ describe('session synchronization recovery', () => {
     expect(failure.code).toBe(47019);
     expect(store.get('import:sync-task')).not.toBeNull();
     expect(bridge.associationSyncState({ kind: OwnershipTargetKind.Task, id: 'sync-task' })).toBe(OwnershipSyncState.Failed);
-    expect(bridge.state().error).toBe('Some conversations need synchronization recovery');
+    expect(bridge.state()).toMatchObject({ error: undefined, errorCode: undefined, sessionSyncStatus: RemoteSyncStatus.Error });
     expect(warning).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(warning.mock.calls)).not.toContain(secret);
     expect(JSON.stringify(warning.mock.calls)).not.toContain('accessToken');
@@ -172,7 +174,7 @@ describe('session synchronization recovery', () => {
     expect(store.get('import:sync-task')).toBeNull();
     expect(store.pending('sync-task')).toEqual([]);
     expect(bridge.associationSyncState({ kind: OwnershipTargetKind.Task, id: 'sync-task' })).toBe(OwnershipSyncState.Synced);
-    expect(bridge.state().error).toBeUndefined();
+    expect(bridge.state()).toMatchObject({ error: undefined, errorCode: undefined, sessionSyncStatus: RemoteSyncStatus.Synced });
   });
 
   it('pauses quota failures without dropping content and allows an explicit reconnect to retry', async () => {
@@ -220,7 +222,7 @@ describe('session synchronization recovery', () => {
     expect(store.get('syncFailure:sync-task')).toBeNull();
     expect(store.get('import:sync-task')).toBeNull();
     expect(bridge.associationSyncState({ kind: OwnershipTargetKind.Task, id: 'sync-task' })).toBe(OwnershipSyncState.Synced);
-    expect(bridge.state().error).toBeUndefined();
+    expect(bridge.state()).toMatchObject({ error: undefined, errorCode: undefined, sessionSyncStatus: RemoteSyncStatus.Synced });
   });
 
   for (const failureAt of ['commit', 'ack'] as const) it(`preserves the failed import and outbox when ${failureAt} fails`, async () => {
@@ -236,8 +238,8 @@ describe('session synchronization recovery', () => {
     store.put('syncFailure:sync-task', { code: 47019, retryAt: 0 });
     const pending = store.pending('sync-task');
     const before = store.sync('sync-task')!;
-    if (failureAt === 'ack') await expect(bridge.syncSessions()).rejects.toThrow('Remote ACK outside durable local bounds');
-    else await bridge.syncSessions();
+    // A malformed import receipt pauses that session without failing the independent control lane.
+    await bridge.syncSessions();
 
     expect(store.get<any>('syncFailure:sync-task')?.code).toBe(failureAt === 'commit' ? 47025 : 47019);
     expect(store.get<any>('import:sync-task')?.beginConfirmed).toBe(true);
@@ -250,14 +252,37 @@ describe('session synchronization recovery', () => {
   it('repairs an old failure marker on an acknowledged task before its retry deadline', async () => {
     const { bridge, store, requestApi } = syncing();
     acknowledgeSnapshot(store);
-    bridge.error = 'Some conversations need synchronization recovery';
+    bridge.sessionSyncFailed = true;
     store.put('syncFailure:sync-task', { code: 47019, retryAt: Date.now() + 60000 });
 
     await bridge.syncSessions();
     expect(requestApi).not.toHaveBeenCalled();
     expect(store.get('syncFailure:sync-task')).toBeNull();
     expect(bridge.associationSyncState({ kind: OwnershipTargetKind.Task, id: 'sync-task' })).toBe(OwnershipSyncState.Synced);
-    expect(bridge.state().error).toBeUndefined();
+    expect(bridge.state()).toMatchObject({ error: undefined, errorCode: undefined, sessionSyncStatus: RemoteSyncStatus.Synced });
+  });
+
+  it('does not restore the previous account synchronization warning after a pending retention fence finishes', async () => {
+    const { bridge, store } = syncing();
+    const failure = { code: 47019, blocked: true };
+    store.put('syncFailure:sync-task', failure);
+    bridge.sessionSyncFailed = true;
+    let currentOwner = owner;
+    vi.spyOn(bridge.deps, 'getOwner').mockImplementation(() => currentOwner);
+    vi.spyOn(bridge, 'schedule').mockImplementation(() => undefined);
+    let releaseFence!: () => void;
+    const pendingFence = new Promise<void>(resolve => { releaseFence = resolve; });
+    const fence = vi.spyOn(bridge, 'ensureRetentionFence').mockReturnValue(pendingFence);
+    const sync = bridge.syncSessions();
+    await Promise.resolve();
+    expect(fence).toHaveBeenCalledTimes(1);
+    currentOwner = { userId: '20002', scopeKey: 'personal' };
+    bridge.accountChanged();
+    expect(bridge.state().sessionSyncStatus).toBe(RemoteSyncStatus.Synced);
+    releaseFence();
+    await sync;
+    expect(bridge.state()).toMatchObject({ owner: currentOwner, sessionSyncStatus: RemoteSyncStatus.Synced });
+    expect(store.get('syncFailure:sync-task')).toEqual(failure);
   });
 
   it('retains the synchronization summary while another owned task still has a failure', async () => {
@@ -270,13 +295,13 @@ describe('session synchronization recovery', () => {
     const failure = { code: 47019, retryAt: Date.now() + 60000 };
     store.put('syncFailure:sync-task', failure);
     store.put('syncFailure:other-task', failure);
-    bridge.error = 'Some conversations need synchronization recovery';
+    bridge.sessionSyncFailed = true;
 
     await bridge.syncSessions();
     expect(requestApi).not.toHaveBeenCalled();
     expect(store.get('syncFailure:sync-task')).toBeNull();
     expect(store.get('syncFailure:other-task')).toEqual(failure);
-    expect(bridge.state().error).toBe('Some conversations need synchronization recovery');
+    expect(bridge.state()).toMatchObject({ error: undefined, errorCode: undefined, sessionSyncStatus: RemoteSyncStatus.Error });
   });
 
   for (const pendingState of ['snapshot', 'source', 'dirty', 'import', 'outbox', 'device'] as const) {
@@ -586,11 +611,138 @@ describe('v4 reply negotiation', () => {
     const paths: string[] = [];
     requestApi.mockImplementation(async (_owner, pathname) => {
       paths.push(pathname);
-      return new Response(JSON.stringify({ code: 0, data: pathname.endsWith('/abort') ? {} : { state: 'uploading', stateVersion: '3' } }));
+      return new Response(JSON.stringify({ code: 0, data: pathname.endsWith('/abort') ? { state: 'aborted' } : { state: 'uploading', stateVersion: '3' } }));
     });
     await bridge.importSession(store.sync('switch'), saved);
     expect(paths).toEqual(['/api/remote/v1/sync/imports/old-import', '/api/remote/v1/sync/imports/old-import/abort']);
     expect(store.get('import:switch')).toBeNull();
     expect(store.sync('switch')?.needs_snapshot).toBe(1); bridge.stop();
+  });
+});
+
+describe('history and command lane isolation', () => {
+  it('claims and applies a command while a history upload remains unresolved', async () => {
+    const { bridge, execute } = fixture();
+    let release!: () => void;
+    const history = vi.spyOn(bridge, 'syncSessions').mockReturnValue(new Promise<void>(resolve => { release = resolve; }));
+    bridge.startHistorySync();
+    expect(history).toHaveBeenCalledOnce();
+    await bridge.claim();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(bridge.historyWork).not.toBeNull();
+    release(); await bridge.historyWork; bridge.stop();
+  });
+  it('preserves same-account switch intent and reports unknown when status storage reads fail', () => {
+    const { bridge, store } = fixture();
+    expect(bridge.state().enabled).toBe(true);
+    const read = vi.spyOn(store, 'get').mockImplementation(() => { throw new Error('cache unavailable'); });
+    expect(bridge.state()).toMatchObject({ enabled: true, connected: false, syncHealth: { status: 'degraded', reason: 'storage_dependency', pendingSessions: null } });
+    read.mockRestore(); bridge.stop();
+  });
+});
+
+
+function questionFixture() {
+  const result = fixture(), envelope: any = result.envelope;
+  envelope.command.type = RemoteQuestion.Command;
+  envelope.request = { ...envelope.request, type: RemoteQuestion.Command, sessionId: 'remote', payload: {
+    runId: 'server-run', questionId: 'question', questionVersion: '1', operationDigest: 'digest', action: 'answer', answers: { q_0: ['Yes'] },
+  } };
+  envelope.requestHash = payloadHash(envelope.request);
+  return result;
+}
+describe('question command receipts and capability negotiation', () => {
+  it('rejects a proven no-send failure with the original claim and question error contract', async () => {
+    const f = questionFixture();
+    f.execute.mockRejectedValue(new RemoteQuestionError({ kind: 'known_not_applied', reason: 'QUESTION_CHANGED' }));
+    await f.bridge.claim();
+    expect(f.store.get<InboxEntry>('inbox:command-1')).toMatchObject({ state: 'rejected', command: { claimId: 'claim', claimToken: 'secret' },
+      result: { code: 47024, reason: 'COMMAND_STATE_CONFLICT', reasonDetail: 'QUESTION_CHANGED' } });
+    f.bridge.stop();
+  });
+  it('keeps an uncertain answer unknown and applies a later exact receipt without replay', async () => {
+    const f = questionFixture();
+    f.execute.mockRejectedValue(new RemoteQuestionError({ kind: 'unknown', reason: 'QUESTION_RESULT_UNKNOWN' }));
+    await f.bridge.claim();
+    f.bridge.deps.reconcileQuestion = vi.fn(async () => ({ kind: 'confirmed', status: 'answered' }));
+    await f.bridge.reconcile();
+    const body = JSON.parse(String(f.requestApi.mock.calls.find(call => call[1].endsWith('/reconcile'))![2].body));
+    expect(body).toMatchObject({ observedExecution: 'applied', claimId: 'claim', claimToken: 'secret', result: { outcome: 'question_applied' }, requestExecutionPermit: false });
+    expect(f.execute).toHaveBeenCalledTimes(1); f.bridge.stop();
+  });
+  it('converges only an existing question receipt while device synchronization is paused', async () => {
+    const f = questionFixture();
+    f.execute.mockRejectedValue(new RemoteQuestionError({ kind: 'unknown', reason: 'QUESTION_RESULT_UNKNOWN' }));
+    await f.bridge.claim();
+    f.bridge.connectionRemoved = true;
+    f.bridge.deps.reconcileQuestion = vi.fn(async () => ({ kind: 'confirmed', status: 'answered' }));
+    await f.bridge.reconcilePaused();
+    const body = JSON.parse(String(f.requestApi.mock.calls.find(call => call[1].endsWith('/reconcile'))![2].body));
+    expect(body).toMatchObject({ mode: 'recovery', observedExecution: 'applied', result: { outcome: 'question_applied' }, requestExecutionPermit: false });
+    expect(f.execute).toHaveBeenCalledTimes(1); f.bridge.stop();
+  });
+  it('never derives question execution from containing run evidence or asks for a fresh permit', async () => {
+    const f = questionFixture(); f.disconnect();
+    await f.bridge.claim(); f.store.put('runPublished:server-run', false);
+    f.bridge.deps.reconcileQuestion = vi.fn(async () => null);
+    await f.bridge.reconcile();
+    const body = JSON.parse(String(f.requestApi.mock.calls.find(call => call[1].endsWith('/reconcile'))![2].body));
+    expect(body).toMatchObject({ observedExecution: 'unknown', requestExecutionPermit: false, localEvidence: null });
+    expect(f.execute).not.toHaveBeenCalled(); f.bridge.stop();
+  });
+  it('negotiates outer v5 only with question support and keeps reply content on its own v4 capability', async () => {
+    const f = fixture(); f.bridge.deps.supportsQuestions = () => true;
+    let enabled = true;
+    f.requestApi.mockImplementation(async () => new Response(JSON.stringify({ code: 0, data: {
+      enabled: true, protocolVersions: [1], projectionVersions: enabled ? [1, 2, 3, 4, 5] : [1, 2, 3, 4],
+      capabilities: [RemoteCapability.SameAccountAccess, RemoteReply.Capability, RemoteQuestion.Capability],
+    } })));
+    await f.bridge.refreshCapabilities();
+    expect(f.bridge.projectionVersion).toBe(5); expect(f.bridge.replySupported).toBe(true);
+    expect(f.bridge.advertisedCapabilities()).toContain(RemoteQuestion.Capability);
+    enabled = false; await f.bridge.refreshCapabilities();
+    expect(f.bridge.projectionVersion).toBe(4); expect(f.bridge.questionsSupported).toBe(false);
+    expect(f.bridge.advertisedCapabilities()).toContain(RemoteQuestion.Capability);
+    f.bridge.stop();
+  });
+});
+
+
+describe('independent reply format inside question projection v5', () => {
+  it.each([true, undefined])('aborts a prior inner reply format (%s) before rebuilding an unchanged v5 envelope', async replyProjection => {
+    const { bridge, store, requestApi } = fixture();
+    bridge.replySupported = false; bridge.questionsSupported = true; bridge.projectionVersion = 5;
+    store.db.exec("INSERT INTO cowork_sessions VALUES ('switch','Task',1,1,'idle')");
+    store.transaction(() => { store.assignNew('switch', owner, 'local_create'); store.bindRemote('switch', 'remote-switch', 'desktop'); });
+    const saved = { importId: 'old-v5-import', sessionId: 'remote-switch', projectionVersion: 5,
+      ...(replyProjection === undefined ? {} : { replyProjection }), beginConfirmed: true,
+      snapshotEpoch: 1, parts: [], manifest: { recordCounts: {} } };
+    store.put('import:switch', saved);
+    const paths: string[] = [];
+    requestApi.mockImplementation(async (_owner, pathname) => {
+      paths.push(pathname);
+      return new Response(JSON.stringify({ code: 0, data: pathname.endsWith('/abort') ? { state: 'aborted' } : { state: 'uploading', stateVersion: '3' } }));
+    });
+    await bridge.importSession(store.sync('switch'), saved);
+    expect(paths).toEqual(['/api/remote/v1/sync/imports/old-v5-import', '/api/remote/v1/sync/imports/old-v5-import/abort']);
+    expect(store.get('import:switch')).toBeNull(); expect(store.sync('switch')?.needs_snapshot).toBe(1);
+    bridge.stop();
+  });
+  it('retains the device protocol declaration after server admission is switched off', async () => {
+    const f = fixture(); f.bridge.deps.supportsQuestions = () => true;
+    let admitted = true;
+    f.requestApi.mockImplementation(async () => new Response(JSON.stringify({ code: 0, data: {
+      enabled: true, protocolVersions: [1], projectionVersions: [1, 2, 3, 4, 5],
+      capabilities: [RemoteCapability.SameAccountAccess, ...(admitted ? [RemoteQuestion.Capability] : [])],
+    } })));
+    await f.bridge.refreshCapabilities(); expect(f.bridge.questionsSupported).toBe(true);
+    admitted = false; await f.bridge.refreshCapabilities();
+    expect(f.bridge.questionsSupported).toBe(false); expect(f.bridge.advertisedCapabilities()).toContain(RemoteQuestion.Capability);
+    expect(f.store.get('questionCapability:10001:personal')).toBe(true); f.bridge.stop();
+  });
+  it('invalidates an in-flight sync context when only the inner reply format changes', () => {
+    const { bridge } = fixture(); bridge.projectionVersion = 5; bridge.replySupported = true;
+    const current = bridge.syncContext(); expect(current()).toBe(true);
+    bridge.replySupported = false; expect(current()).toBe(false); bridge.stop();
   });
 });

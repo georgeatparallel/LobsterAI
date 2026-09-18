@@ -10,6 +10,8 @@ import { remoteSettingsService } from '../../services/remoteSettings';
 import { showToast } from '../../utils/localFileActions';
 import {
   needsRemoteSignIn,
+  remoteAttention,
+  remoteOwnerKey,
   remoteSettingsSwitchChecked,
 } from '../settings/remoteControlState';
 import SettingsSwitch from '../settings/SettingsSwitch';
@@ -19,6 +21,7 @@ interface RemoteControlPopoverProps {
   onClose: () => void;
   onLogin: () => void;
   loginAllowed: boolean;
+  onOpenDeviceManagement?: () => void;
 }
 
 const t = (key: string) => i18nService.t(key);
@@ -52,7 +55,7 @@ class MobileEntryQrBoundary extends React.Component<{ children: React.ReactNode;
   }
 }
 
-export function RemoteControlPopover({ anchorRef, onClose, onLogin, loginAllowed }: RemoteControlPopoverProps): React.ReactElement {
+export function RemoteControlPopover({ anchorRef, onClose, onLogin, loginAllowed, onOpenDeviceManagement }: RemoteControlPopoverProps): React.ReactElement {
   const { state, busy, error } = useSyncExternalStore(
     remoteSettingsService.subscribe, remoteSettingsService.getSnapshot, remoteSettingsService.getSnapshot,
   );
@@ -73,6 +76,16 @@ export function RemoteControlPopover({ anchorRef, onClose, onLogin, loginAllowed
   const enabled = remoteSettingsSwitchChecked(state, RemoteSetting.Connection);
   const keepAwake = remoteSettingsSwitchChecked(state, RemoteSetting.KeepAwake);
   const displayedError = error || actionError;
+  const attention = remoteAttention(state);
+  const attentionIdentity = attention ? `${state?.accountEpoch ?? remoteOwnerKey(state)}:${attention.key}` : '';
+  const [visibleAttention, setVisibleAttention] = useState('');
+  useEffect(() => {
+    if (!attentionIdentity) { setVisibleAttention(''); return; }
+    if (attention?.immediate) { setVisibleAttention(attentionIdentity); return; }
+    setVisibleAttention('');
+    const timer = setTimeout(() => setVisibleAttention(attentionIdentity), 15000);
+    return () => clearTimeout(timer);
+  }, [attentionIdentity, attention?.immediate]);
 
   useLayoutEffect(() => {
     if (displayedEpoch.current && displayedEpoch.current !== state?.accountEpoch) {
@@ -214,6 +227,10 @@ export function RemoteControlPopover({ anchorRef, onClose, onLogin, loginAllowed
         {renderSwitch(RemoteSetting.Connection, enabled, 'remoteAllowConnection')}
         {renderSwitch(RemoteSetting.KeepAwake, keepAwake, 'remoteKeepAwake')}
       </div>
+      {attention && (attention.immediate || visibleAttention === attentionIdentity) && onOpenDeviceManagement && <div role="status" className="mt-2 flex items-start justify-between gap-2 text-xs leading-5 text-amber-700 dark:text-amber-400">
+        <span>{t(attention.key)}</span>
+        <button type="button" className={`${ACTION_CLASS} shrink-0`} onClick={() => { restoreFocus.current = false; onClose(); onOpenDeviceManagement(); }}>{t('remoteDeviceManagement')}</button>
+      </div>}
       {state && signInRequired && !loginAllowed && <p className="mt-1 text-xs text-secondary">{t('remoteLoginUnavailable')}</p>}
       {!state && !displayedError && <p role="status" className="mt-1 text-xs text-secondary">{t('remoteLoading')}</p>}
       {displayedError && <div role="alert" className="mt-2 text-xs leading-5 text-red-600 dark:text-red-400">

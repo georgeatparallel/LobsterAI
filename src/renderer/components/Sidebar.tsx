@@ -1010,7 +1010,8 @@ const Sidebar: React.FC<SidebarProps> = ({
       )}
       {remoteControlOpen && canShowRemoteControl && (
         <RemoteControlPopover anchorRef={remoteControlButton} onClose={closeRemoteControl}
-          onLogin={onShowLogin} loginAllowed={!hideLogin} />
+          onLogin={onShowLogin} loginAllowed={!hideLogin}
+          onOpenDeviceManagement={hideDeviceManagement ? undefined : () => onShowSettings({ initialTab: 'remoteDevices' })} />
       )}
       {/* Batch Delete Confirmation Modal */}
       {showBatchDeleteConfirm && (

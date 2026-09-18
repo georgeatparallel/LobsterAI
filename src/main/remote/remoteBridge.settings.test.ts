@@ -225,7 +225,7 @@ class FakeSocket extends EventTarget {
   frame(data: unknown): void { this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(data) })); }
 }
 describe('truthful remote connection state', () => {
-  it('keeps a failed ticket request visible while recovering existing work over HTTPS', async () => {
+  it('shows quota waiting and stops business synchronization while preserving the enabled preference', async () => {
     const { bridge, request } = fixture();
     const original = request.getMockImplementation()!;
     request.mockImplementation(async (owner, pathname, init) => {
@@ -233,10 +233,11 @@ describe('truthful remote connection state', () => {
       return original(owner, pathname, init);
     });
     await bridge.tick();
-    expect(bridge.state()).toMatchObject({ connected: false, connectionReason: RemoteConnectionReason.ServerUnavailable, errorCode: 47022 });
-    expect(request.mock.calls.some(([, pathname]) => pathname.includes('/commands?'))).toBe(true);
+    expect(bridge.state()).toMatchObject({ connected: false, connectionReason: RemoteConnectionReason.QuotaBlocked, errorCode: 47022 });
+    expect(request.mock.calls.some(([, pathname]) => pathname.includes('/commands?'))).toBe(false);
+    expect(bridge.state().enabled).toBe(true);
     bridge.disconnect();
-    expect(bridge.state()).toMatchObject({ connectionReason: RemoteConnectionReason.ServerUnavailable, errorCode: 47022 });
+    expect(bridge.state()).toMatchObject({ connectionReason: RemoteConnectionReason.QuotaBlocked, errorCode: 47022 });
   });
   it('retains socket errors through cleanup and automatic retries until hello succeeds', async () => {
     vi.stubGlobal('WebSocket', FakeSocket);
@@ -378,5 +379,77 @@ describe('truthful remote connection state', () => {
     switchOwner({ userId: '20002', scopeKey: 'personal' });
     stale.frame({ type: 'hello', protocolVersion: REMOTE_PROTOCOL_VERSION, connectionGeneration: '2' });
     expect(bridge.state()).toMatchObject({ connected: false, owner: { userId: '20002', scopeKey: 'personal' } });
+  });
+});
+
+describe('remote error recovery', () => {
+  it('clears a transient REST error only after the failed endpoint recovers, without reconnecting WS', async () => {
+    vi.stubGlobal('WebSocket', FakeSocket);
+    const { bridge, request } = fixture();
+    await bridge.connect();
+    const socket = FakeSocket.instances.at(-1)!;
+    socket.frame({ type: 'hello', protocolVersion: REMOTE_PROTOCOL_VERSION, connectionGeneration: '1' });
+    request.mockResolvedValueOnce(new Response('<html>Bad Gateway</html>', { status: 502 }));
+    await bridge.tick();
+    expect(bridge.state()).toMatchObject({ connected: true, errorCode: 502, connectionReason: RemoteConnectionReason.ServerUnavailable });
+    socket.frame({ type: 'pong' });
+    await bridge.api('/devices/desktop/settings');
+    expect(bridge.state().errorCode).toBe(502);
+    await bridge.tick();
+    expect(bridge.state()).toMatchObject({ connected: true, error: undefined, errorCode: undefined, connectionReason: RemoteConnectionReason.Connecting });
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it('does not mistake a successful GET for recovery of a failed mutation', async () => {
+    const { bridge, request } = fixture();
+    request.mockRejectedValueOnce(new TypeError('temporary network failure'));
+    try { await bridge.api('/devices/desktop/settings', 'PATCH', { remoteEnabled: true }); }
+    catch (error) { bridge.recordConnectionFailure(error); }
+    expect(bridge.state().error).toBeDefined();
+    await bridge.api('/devices/desktop/settings');
+    expect(bridge.state().error).toBeDefined();
+    await bridge.api('/devices/desktop/settings', 'PATCH', { remoteEnabled: true });
+    expect(bridge.state()).toMatchObject({ error: undefined, errorCode: undefined });
+  });
+
+  it('keeps Agent synchronization failure separate from WS health until catalog publication succeeds', async () => {
+    vi.stubGlobal('WebSocket', FakeSocket);
+    const { bridge, store } = fixture();
+    await bridge.connect();
+    const socket = FakeSocket.instances.at(-1)!;
+    socket.frame({ type: 'hello', protocolVersion: REMOTE_PROTOCOL_VERSION, connectionGeneration: '1' });
+    bridge.lastCapabilityCheck = Date.now();
+    bridge.agentCapabilities = [RemoteCapability.AgentCatalog];
+    const publish = vi.fn().mockRejectedValueOnce(new RemoteApiError(47029, 'Agent version conflict')).mockResolvedValue(undefined);
+    bridge.agentCatalog = { publish };
+    await bridge.tick();
+    expect(bridge.state()).toMatchObject({ connected: true, error: undefined, errorCode: undefined,
+      agentCatalogSyncStatus: RemoteSyncStatus.Error });
+    expect(store.get(bridge.catalogFailureKey())).toEqual({ code: 47029 });
+    socket.frame({ type: 'pong' });
+    await bridge.tick();
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(bridge.state().agentCatalogSyncStatus).toBe(RemoteSyncStatus.Error);
+    bridge.agentCatalogRetryAt = 0;
+    await bridge.tick();
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(store.get(bridge.catalogFailureKey())).toBeNull();
+    expect(bridge.state()).toMatchObject({ connected: true, error: undefined, errorCode: undefined,
+      agentCatalogSyncStatus: RemoteSyncStatus.Synced });
+  });
+
+  it('does not downgrade catalog authentication failures to a retryable sync warning', async () => {
+    vi.stubGlobal('WebSocket', FakeSocket);
+    const { bridge } = fixture();
+    await bridge.connect();
+    const socket = FakeSocket.instances.at(-1)!;
+    socket.frame({ type: 'hello', protocolVersion: REMOTE_PROTOCOL_VERSION, connectionGeneration: '1' });
+    bridge.lastCapabilityCheck = Date.now();
+    bridge.agentCapabilities = [RemoteCapability.AgentCatalog];
+    bridge.agentCatalog = { publish: vi.fn().mockRejectedValue(new RemoteApiError(47013, 'Invalid credential')) };
+    await bridge.tick();
+    expect(bridge.state()).toMatchObject({ connected: false, errorCode: 47013, connectionReason: RemoteConnectionReason.DeviceUnavailable });
+    expect(bridge.suspended).toBe(true);
+    expect(socket.close).toHaveBeenCalled();
   });
 });

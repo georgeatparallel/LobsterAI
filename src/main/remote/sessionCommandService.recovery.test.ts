@@ -175,3 +175,22 @@ it('pages state keys without changing the single-argument entries contract', () 
   expect(f.remote.entries('page:', '', 2).map(x => x.key)).toEqual(['page:a', 'page:b']);
   expect(f.remote.entries('page:', 'page:b', 2).map(x => x.key)).toEqual(['page:c']);
 });
+
+it('clears a new prepared configuration only when the current process proves dispatch never occurred', async () => {
+  const f = fixture();
+  f.runtime.patchSession.mockRejectedValueOnce(new Error('gateway unavailable before dispatch'));
+  await expect(f.service.patchConfiguration('task', { model: 'provider/new' })).rejects.toThrow('gateway unavailable');
+  expect(f.remote.get('inputFence:task')).toBeNull();
+  expect(f.remote.entries<{ phase: string }>('inputOperation:').at(-1)?.value.phase).toBe('known_not_applied');
+  const send = vi.fn(async () => ({ success: true }));
+  await expect(f.service.submit({ sessionId: 'task' }, false, send)).resolves.toEqual({ success: true });
+  expect(send).toHaveBeenCalledOnce();
+});
+
+it('does not reinterpret a restored prepared record as proof of non-dispatch', async () => {
+  const f = fixture();
+  f.remote.put('inputFence:task', { schemaVersion: 2, phase: 'prepared', operationId: 'restored', preparedProcessId: 'previous-process' });
+  f.runtime.querySessionRecovery.mockResolvedValue(f.snapshot({ previousWriterStopped: true }));
+  await expect(f.service.reconcileSession('task')).resolves.toBe(false);
+  expect(f.remote.get('inputFence:task')).not.toBeNull();
+});

@@ -3,10 +3,17 @@ import { createHash, randomUUID } from 'crypto';
 
 import { OWNERSHIP_MANUAL_SOURCE } from '../../shared/ownership/constants';
 import { REMOTE_MESSAGE_BYTES, type RemoteAgentSummary, type RemoteOwner, type RemoteRunStatusValue } from '../../shared/remote/constants';
+import { RemoteFileReason } from '../../shared/remote/files';
+import { type LocalQuestionState, RemoteQuestion, type RemoteQuestionState } from '../../shared/remote/questions';
 import { RemoteReply, RemoteReplyBlockType, type RemoteReplyContentRef, type RemoteReplyFormat, type RemoteReplyUpload } from '../../shared/remote/reply';
 import { RemoteRetention } from '../../shared/remote/retention';
 import { payloadHash, remoteError, sameOwner, stableJson } from './canonical';
 import type { DesktopInputRun } from './desktopInputMetadata';
+import { remoteArtifactReasons } from './remoteArtifactProjection';
+import { RemoteDatabaseHealth } from './remoteDatabaseHealth';
+import { acknowledgeRemoteSessionDeletion } from './remoteLocalGc';
+import { RemoteProjectionCoordinator } from './remoteProjectionCoordinator';
+import type { ProjectionWork } from './remoteProjectionWorker';
 import { isPublicReplyMessage, redactReplyText,replyAppendDelta, replyBlockId, replyBlocks, replyChunks, replyToolState } from './remoteReplyProjection';
 import { RemoteSyncStateError, retentionEventId, retentionSequence, safeSourceSequence } from './remoteRetention';
 import { remoteSyncErrorMetadata } from './remoteSyncLog';
@@ -36,13 +43,40 @@ const publicMessage = (row: any): boolean => {
 const shortName = (value: unknown): string => String(value || '').slice(0, 128).replace(/[\uD800-\uDBFF]$/u, '');
 const publicText = (value: unknown): string => String(value || '').replace(/<think(?:ing)?>[\s\S]*?(<\/think(?:ing)?>|$)/gi, '').replace(/(?:file|lobster-artifact):\/\/[^\s)]+/gi, '[desktop file]');
 
+const desktopInputReason = (job: { reason?: unknown; snapshot?: unknown }, captureReason?: unknown): string => {
+  for (const reason of [job.reason, captureReason]) {
+    if (typeof reason !== 'string') continue;
+    if (remoteArtifactReasons.has(reason)) return reason;
+    if (reason === 'ASSET_MISSING') return 'FILE_MISSING';
+    if (reason === 'ASSET_FILE_CHANGED') return RemoteFileReason.Source;
+  }
+  return job.snapshot ? RemoteFileReason.Transfer : RemoteFileReason.Source;
+};
+
 /** Native SQLite transactions commit synchronously; no deferred persistence is allowed here. */
 export class RemoteStore {
+  private securityRecoveryRequired = false;
+  private ownershipSigner: ((sessionId: string, userId: string, scopeKey: string, operationId: string) => string) | null = null;
+  setSecurityRecoveryRequired(required: boolean): void { this.securityRecoveryRequired = required || !!this.db.prepare("SELECT 1 FROM remote_corrupt_state WHERE key LIKE 'run:%' LIMIT 1").get(); }
+  needsSecurityRecovery(): boolean { return this.securityRecoveryRequired; }
+  setOwnershipSigner(signer: NonNullable<RemoteStore['ownershipSigner']>): void { this.ownershipSigner = signer; }
+  private signOwnership(sessionId: string, owner: RemoteOwner): void {
+    const operationId = randomUUID();
+    if (!this.ownershipSigner) {
+      this.db.prepare('INSERT OR REPLACE INTO remote_ownership_pending VALUES (?,?,?,?,?)').run(sessionId, owner.userId, owner.scopeKey, operationId, this.get<string>('databaseInstance'));
+      return;
+    }
+    this.put(`ownershipProof:${sessionId}`, { operationId, signature: this.ownershipSigner(sessionId, owner.userId, owner.scopeKey, operationId) });
+  }
+  private recoveringRuns = false;
+  private runRecovery: Promise<void> = Promise.resolve();
+  private runtimeTouchedSessions = new Set<string>();
   private depth = 0;
   private changeVersion = 0;
   private publishing = false;
   private artifactTracking = false;
   private approvalProjectionSupported = false;
+  private questionProjectionSupported = false;
   private inputProjectionSupported = false;
   private fileProjectionSupported = false;
   private replyProjectionSupported = false;
@@ -57,11 +91,21 @@ export class RemoteStore {
   private urgentReplyChange = false;
   private agentSummary: ((sessionId: string, owner: RemoteOwner) => RemoteAgentSummary | null) | null = null;
 
-  constructor(readonly db: Database.Database) {
+  private readonly databaseHealth: RemoteDatabaseHealth | null;
+  private readonly projector: RemoteProjectionCoordinator | null;
+  constructor(readonly db: Database.Database, private readonly options: { deferredProjection?: boolean; restoreRuns?: boolean; projectionWorkerPath?: string } = {}) {
+    this.databaseHealth = options.deferredProjection && db.name !== ':memory:' && options.restoreRuns !== false ? new RemoteDatabaseHealth(db.name) : null;
+    this.projector = options.deferredProjection && options.restoreRuns !== false ? new RemoteProjectionCoordinator(this, options.projectionWorkerPath) : null;
     // Set outside transactions. FULL makes inbox receipts/outbox ACK cleanup durable at COMMIT.
     db.pragma('journal_mode = WAL');
     db.pragma('synchronous = FULL');
     db.exec(`
+      CREATE TABLE IF NOT EXISTS remote_corrupt_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,detected_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS remote_session_revisions(session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, dirty_at INTEGER NOT NULL, clean_revision INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS remote_projection_publications(session_id TEXT PRIMARY KEY,path TEXT NOT NULL,source_seq INTEGER NOT NULL,revision INTEGER NOT NULL,digest TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS remote_projection_failures(session_id TEXT PRIMARY KEY,reason TEXT NOT NULL,retry_at INTEGER NOT NULL,revision INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS remote_object_state(session_id TEXT NOT NULL,object_key TEXT NOT NULL,revision INTEGER NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(session_id,object_key));
+      CREATE TABLE IF NOT EXISTS remote_ownership_pending(session_id TEXT PRIMARY KEY,owner_user_id TEXT NOT NULL,owner_scope_key TEXT NOT NULL,operation_id TEXT NOT NULL,database_id TEXT);
       CREATE TABLE IF NOT EXISTS remote_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS remote_write_context (id INTEGER PRIMARY KEY CHECK(id=1), trusted INTEGER NOT NULL);
       INSERT OR IGNORE INTO remote_write_context VALUES (1,0);
@@ -86,17 +130,23 @@ export class RemoteStore {
       CREATE TABLE IF NOT EXISTS remote_reply_chunks(session_id TEXT NOT NULL, sha256 TEXT NOT NULL, content TEXT NOT NULL, size_bytes INTEGER NOT NULL, PRIMARY KEY(session_id,sha256));
       CREATE TABLE IF NOT EXISTS remote_source_owner (source_id TEXT PRIMARY KEY, owner_json TEXT NOT NULL);
     `);
+    if (!(db.prepare('PRAGMA table_info(remote_session_revisions)').all() as Array<{ name: string }>).some(column => column.name === 'clean_revision')) db.exec('ALTER TABLE remote_session_revisions ADD COLUMN clean_revision INTEGER NOT NULL DEFAULT 0');
     const syncColumns = new Set((db.prepare('PRAGMA table_info(remote_sync)').all() as Array<{ name: string }>).map(column => column.name));
     for (const [name, declaration] of Object.entries({ sync_environment: 'TEXT', sync_protocol_version: 'INTEGER NOT NULL DEFAULT 1', stream_epoch: 'TEXT',
       source_purge_seq: "TEXT NOT NULL DEFAULT '0'", event_purge_seq: "TEXT NOT NULL DEFAULT '0'", migration_frozen: 'INTEGER NOT NULL DEFAULT 0' })) {
       if (!syncColumns.has(name)) db.exec(`ALTER TABLE remote_sync ADD COLUMN ${name} ${declaration}`);
     }
     this.replyProjectionSupported = this.get<boolean>('replyProjectionMode') === true;
+    this.questionProjectionSupported = this.get<boolean>('questionProjectionMode:default') === true;
     for (const table of ['cowork_sessions', 'cowork_messages']) {
       const sid = table === 'cowork_sessions' ? 'id' : 'session_id';
       for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
         const ref = operation === 'DELETE' ? 'OLD' : 'NEW';
-        db.exec(`CREATE TRIGGER IF NOT EXISTS remote_content_${table}_${operation.toLowerCase()}
+        db.exec(`CREATE TRIGGER IF NOT EXISTS remote_revision_${table}_${operation.toLowerCase()}
+          AFTER ${operation} ON ${table} BEGIN
+          INSERT INTO remote_session_revisions(session_id,revision,dirty_at) VALUES (${ref}.${sid},1,CAST(strftime('%s','now') AS INTEGER)*1000)
+          ON CONFLICT(session_id) DO UPDATE SET dirty_at=CASE WHEN revision=clean_revision THEN excluded.dirty_at ELSE dirty_at END,revision=revision+1; END;
+          CREATE TRIGGER IF NOT EXISTS remote_content_${table}_${operation.toLowerCase()}
           AFTER ${operation} ON ${table} BEGIN INSERT OR IGNORE INTO remote_content_dirty VALUES (${ref}.${sid}); END;
           CREATE TRIGGER IF NOT EXISTS remote_${table}_${operation.toLowerCase()}
           AFTER ${operation} ON ${table} BEGIN
@@ -127,18 +177,122 @@ export class RemoteStore {
       }
     }
     db.prepare('UPDATE remote_write_context SET trusted=0 WHERE id=1').run();
-    // Process exits are not completion evidence. Preserve run identity for reconciliation.
-    for (const row of this.db.prepare("SELECT key,value FROM remote_state WHERE key LIKE 'run:%'").all() as any[]) {
-      const run = JSON.parse(row.value) as RemoteRun;
-      if (!terminal.has(run.status)) this.updateRun(String(row.key).slice('run:'.length), 'reconciling');
+    // Large histories are reconciled in bounded pages after the shell can start.
+    if (options.restoreRuns !== false) {
+      if (options.deferredProjection) {
+        this.recoveringRuns = true;
+        this.runRecovery = new Promise(resolve => {
+          let cursor = 'run:';
+          const step = (): void => {
+            if (!db.open) { this.recoveringRuns = false; resolve(); return; }
+            try {
+              const rows = db.prepare("SELECT key,value FROM remote_state WHERE key>? AND key<'run;' ORDER BY key LIMIT 50").all(cursor) as Array<{ key: string; value: string }>;
+              this.recoverRunRows(rows);
+              if (rows.length === 50) { cursor = rows.at(-1)!.key; setImmediate(step); return; }
+            } catch { this.securityRecoveryRequired = true; }
+            this.recoveringRuns = false; this.runtimeTouchedSessions.clear(); resolve();
+          };
+          setImmediate(step);
+        });
+      } else this.recoverRunRows(this.db.prepare("SELECT key,value FROM remote_state WHERE key LIKE 'run:%'").all() as Array<{ key: string; value: string }>);
     }
   }
+  private recoverRunRows(rows: Array<{ key: string; value: string }>): void {
+    for (const row of rows) {
+      const sessionId = row.key.slice('run:'.length);
+      if (this.runtimeTouchedSessions.has(sessionId)) continue;
+      try {
+        const run = JSON.parse(row.value) as RemoteRun;
+        if (!run || typeof run.runId !== 'string' || typeof run.status !== 'string' || !/^[1-9][0-9]*$/u.test(run.statusVersion)) throw new Error('Invalid run evidence');
+        if (!terminal.has(run.status)) this.updateRun(sessionId, 'reconciling');
+      } catch {
+        this.db.prepare('INSERT OR IGNORE INTO remote_corrupt_state VALUES (?,?,?)').run(row.key, row.value, Date.now());
+        this.securityRecoveryRequired = true;
+        console.warn('[RemoteSync] Invalid run evidence isolated from application startup', { key: row.key });
+      }
+    }
+  }
+  waitRunRecovery(): Promise<void> { return this.runRecovery; }
 
+  private touchProjection(sessionId: string): void {
+    this.db.prepare(`INSERT INTO remote_session_revisions(session_id,revision,dirty_at) VALUES (?,1,?)
+      ON CONFLICT(session_id) DO UPDATE SET dirty_at=CASE WHEN revision=clean_revision THEN excluded.dirty_at ELSE dirty_at END,revision=revision+1`).run(sessionId, Date.now());
+  }
+  projectionRevision(sessionId: string): number {
+    return (this.db.prepare('SELECT revision FROM remote_session_revisions WHERE session_id=?').get(sessionId) as { revision: number } | undefined)?.revision || 0;
+  }
+  projectionPublishing(sessionId: string): boolean { return !!this.db.prepare('SELECT 1 FROM remote_projection_publications WHERE session_id=?').get(sessionId); }
+  retryProjections(): void { this.db.prepare('DELETE FROM remote_projection_failures').run(); }
+  flushProjections(): Promise<void> { return this.projector?.flush() || Promise.resolve(); }
+  configureDetachedProjection(work: ProjectionWork): void {
+    this.enabledOwner = work.owner; this.approvalProjectionSupported = work.approval; this.questionProjectionSupported = work.questions; this.inputProjectionSupported = work.input;
+    this.fileProjectionSupported = work.files; this.replyProjectionSupported = work.reply; this.fileEnvironment = work.environment;
+  }
+  private questionEvidenceHealthy(): boolean {
+    const corrupt = this.db.prepare("SELECT 1 FROM remote_state WHERE key LIKE 'questionDecision:%' AND NOT json_valid(value) LIMIT 1").get();
+    if (corrupt) this.securityRecoveryRequired = true;
+    return !corrupt;
+  }
+  nextProjectionWork(): ProjectionWork | null {
+    if (!this.questionEvidenceHealthy()) return null;
+    if (!this.enabledOwner || !this.options.deferredProjection || this.securityRecoveryRequired) return null;
+    // Interrupted publication reserves sequences permanently; rebuild all bodies from core + monotonic object identities.
+    for (const row of this.db.prepare('SELECT session_id FROM remote_projection_publications LIMIT 1').all() as Array<{ session_id: string }>) {
+      this.db.transaction(() => {
+        this.requireSnapshot(row.session_id, 'publication_interrupted');
+        this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(row.session_id);
+        this.db.prepare('DELETE FROM remote_projection_publications WHERE session_id=?').run(row.session_id);
+      })();
+    }
+    const row = this.db.prepare(`SELECT d.session_id FROM remote_dirty d JOIN cowork_session_ownership o ON o.session_id=d.session_id
+      JOIN remote_sync s ON s.local_id=d.session_id LEFT JOIN remote_projection_failures f ON f.session_id=d.session_id
+      LEFT JOIN remote_session_revisions r ON r.session_id=d.session_id
+      WHERE o.ownership_status='confirmed' AND o.owner_user_id=? AND o.owner_scope_key=? AND s.migration_frozen=0
+        AND (f.session_id IS NULL OR (f.reason<>'REMOTE_PROJECTION_BUDGET' AND f.revision<>r.revision) OR f.retry_at<=?) ORDER BY r.dirty_at,d.session_id LIMIT 1`)
+      .get(this.enabledOwner.userId, this.enabledOwner.scopeKey, Date.now()) as { session_id: string } | undefined;
+    if (!row) return null;
+    const sync = this.sync(row.session_id)!;
+    return { database: this.db.name, target: '', sessionId: row.session_id, owner: { ...this.enabledOwner },
+      deviceId: this.projectionIdentity?.deviceId || sync.device_id, environment: this.fileEnvironment || this.projectionIdentity?.environment || null,
+      agent: this.agentSummary?.(row.session_id, this.enabledOwner) || null, approval: this.approvalProjectionSupported, questions: this.questionProjectionSupported,
+      input: this.inputProjectionSupported, files: this.fileProjectionSupported, reply: this.replyProjectionSupported };
+  }
+  projectionWorkCurrent(work: ProjectionWork): boolean {
+    return sameOwner(work.owner, this.enabledOwner) && sameOwner(this.owner(work.sessionId), work.owner)
+      && work.approval === this.approvalProjectionSupported && work.questions === this.questionProjectionSupported && work.input === this.inputProjectionSupported
+      && work.files === this.fileProjectionSupported && work.reply === this.replyProjectionSupported
+      && work.deviceId === (this.projectionIdentity?.deviceId || this.sync(work.sessionId)?.device_id)
+      && work.environment === (this.fileEnvironment || this.projectionIdentity?.environment || null);
+  }
+  projectIsolatedForTest(sessionId: string): void {
+    try {
+      this.db.transaction(() => {
+        this.project(sessionId); this.db.prepare('DELETE FROM remote_dirty WHERE session_id=?').run(sessionId);
+        this.db.prepare('DELETE FROM remote_content_dirty WHERE session_id=?').run(sessionId);
+      })();
+    } catch (error) { this.recordProjectionFailure(sessionId, error instanceof Error ? error.message : 'REMOTE_PROJECTION_FAILED'); }
+  }
+  recordProjectionFailure(sessionId: string, reason: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO remote_projection_failures VALUES (?,?,?,?)')
+      .run(sessionId, reason, reason === 'REMOTE_PROJECTION_BUDGET' ? Number.MAX_SAFE_INTEGER : Date.now() + 30_000, this.projectionRevision(sessionId));
+  }
+  retainObjectIdentity(sessionId: string, row: { object_key: string; revision: number; record_json: string }): void {
+    const record = JSON.parse(row.record_json) as ProjectionRecord;
+    if (record.eventType === RemoteQuestion.Event) return; // The private decision fact already owns question versions and content.
+    if (record.payload.message) {
+      const { messageId, ordinal, revision, runId, commandId } = record.payload.message;
+      record.payload.message = { messageId, ordinal, revision, runId, commandId };
+    }
+    this.db.prepare(`INSERT INTO remote_object_state VALUES (?,?,?,?) ON CONFLICT(session_id,object_key)
+      DO UPDATE SET revision=excluded.revision,record_json=excluded.record_json WHERE excluded.revision>=remote_object_state.revision`)
+      .run(sessionId, row.object_key, row.revision, stableJson(record));
+  }
   setWake(listener: (urgent?: boolean) => void): void { this.wake = listener; }
   setFileTerminalBoundary(listener: (sessionId: string, runId: string) => void): void { this.fileTerminalBoundary = listener; }
   setFileEnvironment(environment: string): void { this.fileEnvironment = environment; }
   setArtifactProjectionResolver(resolver: NonNullable<RemoteStore['artifactProjection']>): void { this.artifactProjection = resolver; }
   markFilesDirty(sessionId: string): void {
+    this.touchProjection(sessionId);
     this.db.prepare('INSERT OR IGNORE INTO remote_content_dirty VALUES (?)').run(sessionId);
     this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(sessionId);
   }
@@ -150,6 +304,7 @@ export class RemoteStore {
     this.db.prepare(`UPDATE remote_sync SET sync_environment=? WHERE sync_environment IS NULL AND (device_id='' OR device_id=?)
       AND local_id IN (SELECT session_id FROM cowork_session_ownership WHERE owner_user_id=? AND owner_scope_key=?)`).run(environment, deviceId, owner.userId, owner.scopeKey);
     this.replyProjectionSupported = this.get<boolean>(key) ?? this.get<boolean>('replyProjectionMode') ?? false;
+    this.questionProjectionSupported = this.get<boolean>(`questionProjectionMode:${key}`) ?? false;
   }
   private projectionSessions(): Array<{ session_id: string }> {
     const owner = this.projectionIdentity?.owner || this.enabledOwner;
@@ -210,6 +365,10 @@ export class RemoteStore {
   }
   /** Retain exact references held by projections, immutable outbox events and resumable imports. */
   pruneReplyContents(sessionId: string): void {
+    if (this.options.deferredProjection && this.options.restoreRuns !== false) return;
+    if (this.projectionPublishing(sessionId)) return;
+    // A disk-backed import holds immutable references outside this database; keep its content versions until its terminal ACK/abort.
+    if (this.get<{ fileSet?: string }>(`import:${sessionId}`)?.fileSet) return;
     const refs = new Set<string>();
     const visit = (value: any): void => {
       if (!value || typeof value !== 'object') return;
@@ -229,6 +388,46 @@ export class RemoteStore {
   }
   setEnabledOwner(owner: RemoteOwner | null): void { this.enabledOwner = owner; }
   setApprovalProjectionSupported(supported: boolean): void { this.approvalProjectionSupported = supported; }
+  setQuestionProjectionSupported(supported: boolean): void {
+    const key = `questionProjectionMode:${this.projectionIdentity?.key || 'default'}`;
+    if (supported === this.questionProjectionSupported) { this.put(key, supported); return; }
+    this.questionProjectionSupported = supported;
+    this.transaction(() => {
+      this.put(key, supported);
+      for (const { session_id } of this.projectionSessions()) {
+        this.requireSnapshot(session_id, 'question_projection_changed');
+        this.markFilesDirty(session_id);
+      }
+    });
+  }
+  /** Public projection is recoverable from the private decision fact after a cache write failure. */
+  questionStates(sessionId: string): RemoteQuestionState[] {
+    this.questionEvidenceHealthy();
+    const values = new Map(this.entries<RemoteQuestionState>(`question:${sessionId}:`).map(row => [row.value.questionId, row.value]));
+    const facts = this.db.prepare("SELECT value FROM remote_state WHERE key LIKE 'questionDecision:%' AND CASE WHEN json_valid(value) THEN json_extract(value,'$.state.sessionId') END=?").all(sessionId) as Array<{ value: string }>;
+    for (const row of facts) {
+      const { state, binding } = JSON.parse(row.value) as { state: LocalQuestionState; binding: { owner: RemoteOwner | null } };
+      const owner = this.owner(sessionId);
+      if (!binding || (binding.owner !== null || owner !== null) && !sameOwner(binding.owner, owner)) { values.delete(state.questionId); continue; }
+      const { requestId: _requestId, sessionId: _sessionId, ...question } = state;
+      const previous = values.get(question.questionId);
+      if (!previous || BigInt(previous.questionVersion) <= BigInt(question.questionVersion)) values.set(question.questionId, question);
+    }
+    return [...values.values()];
+  }
+  updateQuestion(sessionId: string, question: RemoteQuestionState): void {
+    this.transaction(() => {
+      const key = `question:${sessionId}:${question.questionId}`;
+      const previous = this.get<RemoteQuestionState>(key);
+      if (previous && (BigInt(previous.questionVersion) >= BigInt(question.questionVersion)
+        || previous.status !== 'pending' && question.status === 'pending')) return;
+      this.put(key, question);
+      if (!previous || previous.status !== question.status || previous.remoteAllowed !== question.remoteAllowed
+        || previous.resolution.phase !== question.resolution.phase) this.bumpControl(sessionId);
+      this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(sessionId);
+      this.refreshApprovalRunState(sessionId);
+    });
+  }
   setApprovalLifecycle(lifecycle: { expire(now: number): void; close(sessionId: string, runId: string, status: string): void }): void { this.approvalLifecycle = lifecycle; }
   /** Private runtime decisions and their public event are committed in the same SQLite transaction. */
   updateApproval(sessionId: string, approval: Record<string, any>): void {
@@ -259,9 +458,10 @@ export class RemoteStore {
     if (!run || terminal.has(run.status)) return;
     const pending = [...this.entries<any>(`approval:${sessionId}:`), ...this.entries<any>(`localApprovalBlocker:${sessionId}:`)].map(row => row.value)
       .filter(approval => approval.runId === run.runId && approval.status === 'pending');
-    const status = pending.some(approval => approval.resolution?.phase === 'unknown') ? 'reconciling'
+    const questions = this.questionStates(sessionId).filter(question => question.runId === run.runId && question.status === 'pending');
+    const status = pending.some(approval => approval.resolution?.phase === 'unknown') || questions.some(question => question.resolution.phase === 'unknown') ? 'reconciling'
       : pending.some(approval => approval.requiresLocalAction && (!approval.resolution || approval.resolution.phase === 'idle')) ? 'waiting_local'
-      : pending.length ? 'waiting_approval' : engineRunning ? 'running' : null;
+      : questions.length ? 'waiting_local' : pending.length ? 'waiting_approval' : engineRunning ? 'running' : null;
     if (status) this.updateRun(sessionId, status);
   }
   setAgentSummaryResolver(resolver: ((sessionId: string, owner: RemoteOwner) => RemoteAgentSummary | null) | null): void {
@@ -288,11 +488,26 @@ export class RemoteStore {
   }
   get<T>(key: string): T | null {
     const row = this.db.prepare('SELECT value FROM remote_state WHERE key=?').get(key) as { value: string } | undefined;
-    return row ? JSON.parse(row.value) as T : null;
+    if (!row) return null;
+    try { return JSON.parse(row.value) as T; }
+    catch (error) {
+      if (!/^(?:replyProjectionMode$|projectionMode:|questionProjectionMode:|syncFailure:|agentCatalogFailure:|lastSuccessfulSync:)/u.test(key)) throw error;
+      // Only reconstructible/display-only keys have a fallback; run/approval/inbox/ownership facts never do.
+      this.db.prepare('INSERT OR IGNORE INTO remote_corrupt_state VALUES (?,?,?)').run(key, row.value, Date.now());
+      this.db.prepare('DELETE FROM remote_state WHERE key=?').run(key);
+      if (key === 'replyProjectionMode' || key.startsWith('projectionMode:') || key.startsWith('questionProjectionMode:')) this.db.prepare('UPDATE remote_sync SET needs_snapshot=1').run();
+      return null;
+    }
   }
   put(key: string, value: unknown): void {
+    const parts = key.split(':');
+    if (parts[1] && ['run', 'runHistory', 'control', 'approval', 'question', 'localApprovalBlocker', 'inputModel', 'inputVersion', 'inputSignature'].includes(parts[0])) this.touchProjection(parts[1]);
     if (this.depth === 0 && this.advanceCheckpoint) { this.transaction(() => this.put(key, value)); return; }
     this.db.prepare('INSERT INTO remote_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, stableJson(value));
+    if (parts[0] === 'questionDecision') {
+      const sessionId = (value as { state?: { sessionId?: string } }).state?.sessionId;
+      if (sessionId) { this.touchProjection(sessionId); this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(sessionId); }
+    }
   }
   remove(key: string): void { this.db.prepare('DELETE FROM remote_state WHERE key=?').run(key); }
   entries<T>(prefix: string, after?: string, limit?: number): Array<{ key: string; value: T }> {
@@ -312,7 +527,7 @@ export class RemoteStore {
       this.db.prepare('UPDATE remote_write_context SET trusted=1 WHERE id=1').run();
       try {
         const value = operation();
-        if (!this.publishing) this.captureDirty();
+        if (!this.publishing && !this.options.deferredProjection) this.captureDirty();
         if (this.advanceCheckpoint) this.put('databaseCheckpoint', this.advanceCheckpoint());
         return value;
       } finally {
@@ -320,7 +535,7 @@ export class RemoteStore {
         this.depth--;
       }
     })();
-    if (this.changeVersion !== beforeChange) this.wake(this.urgentReplyChange);
+    if (this.options.deferredProjection || this.changeVersion !== beforeChange) this.wake(this.urgentReplyChange);
     return result;
   }
   owner(sessionId: string): RemoteOwner | null {
@@ -340,6 +555,7 @@ export class RemoteStore {
     }
     this.db.prepare('INSERT INTO cowork_session_ownership VALUES (?,?,?,?,?,?)')
       .run(sessionId, owner.userId, owner.scopeKey, 'confirmed', OWNERSHIP_MANUAL_SOURCE, associatedAt);
+    this.signOwnership(sessionId, owner);
     this.db.prepare('INSERT INTO remote_sync(local_id,session_id) VALUES (?,?)').run(sessionId, randomUUID());
     this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(sessionId);
   }
@@ -351,6 +567,7 @@ export class RemoteStore {
     if (!owner) return;
     if (!this.db.inTransaction || this.depth === 0) throw new Error('Ownership must be recorded in the creation transaction');
     this.db.prepare('INSERT INTO cowork_session_ownership VALUES (?,?,?,?,?,?)').run(sessionId, owner.userId, owner.scopeKey, 'confirmed', source, Date.now());
+    this.signOwnership(sessionId, owner);
     this.db.prepare('INSERT INTO remote_sync(local_id,session_id) VALUES (?,?)').run(sessionId, randomUUID());
   }
   inheritNew(sessionId: string, parentId: string): void { this.assignNew(sessionId, this.owner(parentId), 'inherited_parent'); }
@@ -377,8 +594,12 @@ export class RemoteStore {
     this.put('databaseCheckpoint', checkpoint);
     this.advanceCheckpoint = advance || null;
   }
+  async verifyExecutionDatabaseHealth(): Promise<boolean> {
+    return this.databaseHealth ? this.databaseHealth.verify() : this.db.pragma('quick_check', { simple: true }) === 'ok';
+  }
   hasCompleteExecutionHistory(): boolean {
-    return this.get<boolean>('executionHistoryComplete') !== false && this.db.pragma('quick_check', { simple: true }) === 'ok';
+    return !this.recoveringRuns && !this.securityRecoveryRequired && this.get<boolean>('executionHistoryComplete') !== false
+      && (this.databaseHealth ? this.databaseHealth.current() : this.db.pragma('quick_check', { simple: true }) === 'ok');
   }
   markRunDispatched(sessionId: string): void {
     const run = this.run(sessionId);
@@ -414,6 +635,7 @@ export class RemoteStore {
   run(sessionId: string): RemoteRun | null { return this.get<RemoteRun>(`run:${sessionId}`); }
   controlVersion(sessionId: string): string { return this.get<string>(`control:${sessionId}`) || '0'; }
   beginRun(sessionId: string, runId: string = randomUUID(), commandId: string | null = null): RemoteRun {
+    if (this.recoveringRuns) this.runtimeTouchedSessions.add(sessionId);
     const previous = this.run(sessionId);
     if (previous && !terminal.has(previous.status)) throw new Error('REMOTE_SESSION_BUSY');
     const run: RemoteRun = { runId, status: 'starting', statusVersion: '1', startedAt: iso(Date.now()), finishedAt: null, error: null };
@@ -432,6 +654,7 @@ export class RemoteStore {
     return run;
   }
   updateRun(sessionId: string, status: RemoteRunStatusValue, error?: string): void {
+    if (this.recoveringRuns) this.runtimeTouchedSessions.add(sessionId);
     const previous = this.run(sessionId);
     if (!previous || terminal.has(previous.status) || previous.status === status) return;
     this.transaction(() => {
@@ -556,7 +779,7 @@ export class RemoteStore {
     const row = this.sync(sessionId);
     if (!row) return;
     if (this.replyProjectionSupported && ((record.eventType === 'run.updated' && terminal.has(record.payload.run?.status))
-      || record.eventType === 'approval.updated' || (record.eventType === 'tool.upsert' && (record.payload.tool?.revision === '1' || terminal.has(record.payload.tool?.status))))) this.urgentReplyChange = true;
+      || record.eventType === 'approval.updated' || record.eventType === RemoteQuestion.Event || (record.eventType === 'tool.upsert' && (record.payload.tool?.revision === '1' || terminal.has(record.payload.tool?.status))))) this.urgentReplyChange = true;
     if (row.migration_frozen) throw new Error('Remote migration projection is frozen');
     const sourceSeq = safeSourceSequence(String(row.source_seq + 1));
     const event: RemoteEvent = { ...record, eventId: row.sync_protocol_version === RemoteRetention.Version
@@ -581,6 +804,9 @@ export class RemoteStore {
     if (priorApproval?.approvalVersion === approval.approvalVersion) safe = priorApproval;
     this.record(sessionId, `approval:${safe.approvalId}`, { eventType: 'approval.updated', payload: { approval: safe, controlVersion: this.controlVersion(sessionId) } });
   }
+  private projectQuestion(sessionId: string, question: RemoteQuestionState): void {
+    this.record(sessionId, `question:${question.questionId}`, { eventType: RemoteQuestion.Event, payload: { question, controlVersion: this.controlVersion(sessionId) } });
+  }
   project(sessionId: string, summaryOnly = false): void {
     if (this.sync(sessionId)?.migration_frozen) return;
     const s = this.db.prepare('SELECT * FROM cowork_sessions WHERE id=?').get(sessionId) as any;
@@ -603,11 +829,19 @@ export class RemoteStore {
       } catch { /* Legacy malformed metadata has no trusted prepared input. */ }
     }
     const approvals = this.entries<any>(`approval:${sessionId}:`).map(row => row.value);
+    const questions = this.questionProjectionSupported ? this.questionStates(sessionId) : [];
+    const questionKeys = new Set(questions.filter(question => this.get<boolean>(`runPublished:${question.runId}`) !== false).map(question => `question:${question.questionId}`));
+    for (const row of this.db.prepare("SELECT object_key FROM remote_projection WHERE session_id=? AND object_key LIKE 'question:%'").all(sessionId) as Array<{ object_key: string }>) {
+      if (questionKeys.has(row.object_key)) continue;
+      this.db.prepare('DELETE FROM remote_projection WHERE session_id=? AND object_key=?').run(sessionId, row.object_key);
+      this.requireSnapshot(sessionId, 'question_projection_changed');
+    }
     const publishedRunIds = new Set((this.db.prepare("SELECT object_key FROM remote_projection WHERE session_id=? AND object_key LIKE 'run:%'").all(sessionId) as Array<{ object_key: string }>).map(row => row.object_key.slice(4)));
     // A run terminal event may be the last event in an HTTP batch. Publish the executor's
     // exact approval closure first, so the server does not invent a competing cancellation.
     // Initial projections still begin with session.upsert and introduce the run normally.
     for (const approval of approvals) if (approval.status !== 'pending' && publishedRunIds.has(approval.runId)) this.projectApproval(sessionId, approval);
+    for (const question of questions) if (question.status !== 'pending' && publishedRunIds.has(question.runId)) this.projectQuestion(sessionId, question);
     const deferTerminal = this.replyProjectionSupported && !summaryOnly && run && terminal.has(run.status) && publishedRunIds.has(run.runId);
     const deferred: Array<{ key: string; record: ProjectionRecord }> = [];
     const recordState = (key: string, record: ProjectionRecord): void => { if (deferTerminal) deferred.push({ key, record }); else this.record(sessionId, key, record); };
@@ -623,6 +857,7 @@ export class RemoteStore {
       if (this.get<boolean>(`runPublished:${historicalRun.runId}`) !== false) recordState(`run:${historicalRun.runId}`, { eventType: 'run.updated', payload: { run: projectedRun, controlVersion: this.controlVersion(sessionId) } });
     }
     for (const approval of approvals) this.projectApproval(sessionId, approval);
+    for (const question of questions) if (this.get<boolean>(`runPublished:${question.runId}`) !== false) this.projectQuestion(sessionId, question);
     // Agent metadata changes reuse the committed preview and never scan/re-upload conversation messages.
     if (summaryOnly) return;
     const liveKeys = new Set<string>();
@@ -668,7 +903,8 @@ export class RemoteStore {
             ? { type: 'attachment', assetId: job.uploadedAsset.assetId, version: job.uploadedAsset.version, name: job.uploadedAsset.fileName,
               mimeType: job.uploadedAsset.mimeType, sizeBytes: job.uploadedAsset.sizeBytes, availability: 'ready', intent: job.uploadedAsset.intent }
             : { type: 'artifact', artifactId: job.uploadRequestId, name: source.fileName, mimeType: source.mimeType,
-              sizeBytes: source.sizeBytes, availability: 'desktop_only' });
+              sizeBytes: source.sizeBytes, availability: 'desktop_only',
+              ...(this.fileProjectionSupported ? { reason: desktopInputReason(job, source.captureReason) } : {}) });
         }
       }
       const remoteArtifacts = this.fileProjectionSupported ? this.artifactProjection?.(sessionId, m.id) || [] : [];
@@ -735,7 +971,8 @@ export class RemoteStore {
   }
   snapshot(sessionId: string): { baseSourceSeq: string; snapshotEpoch: number; records: ProjectionRecord[] } {
     return this.transaction(() => {
-      this.project(sessionId);
+      if (this.projectionPublishing(sessionId)) throw new Error('REMOTE_PROJECTION_PUBLISHING');
+      if (!this.options.deferredProjection) this.project(sessionId);
       let records = (this.db.prepare('SELECT record_json FROM remote_projection WHERE session_id=? ORDER BY object_key').all(sessionId) as any[]).map(row => JSON.parse(row.record_json));
       const deletion = records.find(record => record.eventType === 'session.deleted');
       if (deletion) records = [deletion];
@@ -743,6 +980,7 @@ export class RemoteStore {
     });
   }
   pending(sessionId: string): RemoteEvent[] {
+    if (this.projectionPublishing(sessionId)) return [];
     const rows = this.db.prepare('SELECT event_json FROM remote_outbox WHERE session_id=? ORDER BY source_seq LIMIT 100').all(sessionId) as any[];
     const result: RemoteEvent[] = [];
     let bytes = 0;
@@ -778,6 +1016,9 @@ export class RemoteStore {
         .run(Number(ack), committedSeq, snapshot && (snapshotEpoch === undefined || snapshotEpoch === (this.get<number>(`snapshotEpoch:${sessionId}`) || 0)) ? 0 : row.needs_snapshot, sessionId);
       this.db.prepare('DELETE FROM remote_outbox WHERE session_id=? AND source_seq<=?').run(sessionId, Number(ack));
       this.pruneReplyContents(sessionId);
+      if (Number(ack) === row.source_seq && !this.db.prepare('SELECT 1 FROM remote_dirty WHERE session_id=?').get(sessionId)) this.db.prepare('UPDATE remote_session_revisions SET clean_revision=revision WHERE session_id=?').run(sessionId);
+      try { acknowledgeRemoteSessionDeletion(this, sessionId); }
+      catch (error) { console.warn('[RemoteSync] Local deletion cleanup receipt deferred', error); }
     });
   }
 }

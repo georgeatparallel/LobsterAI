@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import path from 'path';
 import { afterEach, expect, it, vi } from 'vitest';
 
+import { buildCoworkImageAttachmentPreviews } from '../../shared/cowork/imageAttachments';
 import type { RemoteOwner } from '../../shared/remote/constants';
 import { RemoteInputIntent, RemoteInputMode, RemoteInputReason, type RemotePreparationClaim } from '../../shared/remote/input';
 import type { CoworkStore } from '../coworkStore';
@@ -158,4 +159,92 @@ it('finishes cleanup when the cache root or account directory is already absent'
     expect(await service.cleanupExpired(prepared.expiresAt + 25 * 60 * 60_000)).toBe(1);
     expect(values.has('inputPreparation:prep')).toBe(false);
   }
+});
+
+it('keeps a bounded desktop thumbnail for large mobile images without persisting original image bytes', async () => {
+  const { deps, claim, attach } = fixture();
+  const original = 'x'.repeat(600 * 1024); attach(original, RemoteInputIntent.Image);
+  claim.attachments![0].fileName = 'mobile.png';
+  const preview = { mimeType: 'image/jpeg', base64Data: Buffer.from('small thumbnail').toString('base64') };
+  const createImagePreview = vi.fn(async () => preview);
+  const service = new InputPreparationService({ ...deps, createImagePreview });
+  const prepared = await service.prepare(owner, 'pc', claim, async () => new Response(original), () => true);
+  expect(JSON.stringify(prepared)).not.toContain(Buffer.from(original).toString('base64'));
+  const options = await service.executionOptions(prepared, () => undefined);
+  expect(options.imageAttachments[0].base64Data).toBe(Buffer.from(original).toString('base64'));
+  expect(buildCoworkImageAttachmentPreviews(options.imageAttachments)).toMatchObject([{ name: 'mobile.png', mimeType: 'image/jpeg', base64Data: preview.base64Data }]);
+  expect(options.prompt).toBe(' ');
+  expect(createImagePreview).toHaveBeenCalledTimes(1);
+});
+it('adds desktop previews when executing a preparation saved by an older client', async () => {
+  const { deps, service, claim, attach } = fixture(); const original = 'x'.repeat(600 * 1024); attach(original, RemoteInputIntent.Image);
+  const prepared = await service.prepare(owner, 'pc', claim, async () => new Response(original), () => true);
+  delete prepared.files[0].preview; // Legacy durable records predate the preview field.
+  const createImagePreview = vi.fn(async () => ({ mimeType: 'image/jpeg', base64Data: 'cHJldmlldw==' }));
+  const restarted = new InputPreparationService({ ...deps, createImagePreview });
+  const options = await restarted.executionOptions(prepared, () => undefined);
+  expect(options.imageAttachments[0].previewBase64Data).toBe('cHJldmlldw==');
+  expect(createImagePreview).toHaveBeenCalledWith(prepared.files[0].imagePath);
+});
+it('retains visible filenames and original model images when thumbnail generation fails or exceeds its budget', async () => {
+  const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  try {
+    for (const createImagePreview of [
+      async () => { throw new Error('thumbnail unsupported'); },
+      async () => ({ mimeType: 'image/jpeg', base64Data: Buffer.alloc(128 * 1024 + 1).toString('base64') }),
+    ]) {
+      const { deps, claim, attach } = fixture(); const original = 'x'.repeat(600 * 1024); attach(original, RemoteInputIntent.Image);
+      claim.attachments![0].fileName = 'mobile.png';
+      const service = new InputPreparationService({ ...deps, createImagePreview });
+      const prepared = await service.prepare(owner, 'pc', claim, async () => new Response(original), () => true);
+      const options = await service.executionOptions(prepared, () => undefined);
+      expect(options.imageAttachments[0].base64Data).toBe(Buffer.from(original).toString('base64'));
+      expect(options.imageAttachments[0].previewBase64Data).toBeUndefined();
+      expect(options.prompt).toBe('[File: "mobile.png"]');
+      expect(options.prompt).not.toContain(prepared.cacheDirectory);
+    }
+  } finally { warning.mockRestore(); }
+});
+it('rechecks the account after an asynchronous thumbnail before accepting a preparation', async () => {
+  const { deps, claim, attach, setActor, values } = fixture(); attach('image', RemoteInputIntent.Image);
+  const service = new InputPreparationService({ ...deps, createImagePreview: async () => {
+    setActor({ userId: 'B', scopeKey: 'personal' });
+    return { mimeType: 'image/jpeg', base64Data: 'cHJldmlldw==' };
+  } });
+  await expect(service.prepare(owner, 'pc', claim, async () => new Response('image'), () => true)).rejects.toThrow(RemoteInputReason.Account);
+  expect(values.has('inputPreparation:prep')).toBe(false);
+});
+
+it('times out optional thumbnails without blocking a mobile image command', async () => {
+  const { deps, service, claim, attach } = fixture(); const original = 'x'.repeat(600 * 1024); attach(original, RemoteInputIntent.Image);
+  const prepared = await service.prepare(owner, 'pc', claim, async () => new Response(original), () => true);
+  delete prepared.files[0].preview;
+  let previewStarted!: () => void;
+  const started = new Promise<void>(resolve => { previewStarted = resolve; });
+  const resumed = new InputPreparationService({ ...deps, createImagePreview: async () => {
+    previewStarted(); return new Promise<undefined>(() => undefined);
+  } });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const executing = resumed.executionOptions(prepared, () => undefined);
+    await started;
+    await vi.advanceTimersByTimeAsync(750);
+    const options = await executing;
+    expect(options.imageAttachments).toHaveLength(1);
+    expect(options.prompt).toContain('report.txt');
+    expect(options.prompt).not.toContain(prepared.cacheDirectory);
+  } finally { vi.useRealTimers(); }
+});
+it('does not swallow a revoked execution permit while a legacy thumbnail is being generated', async () => {
+  const { deps, service, claim, attach } = fixture(); attach('image', RemoteInputIntent.Image);
+  const prepared = await service.prepare(owner, 'pc', claim, async () => new Response('image'), () => true);
+  delete prepared.files[0].preview;
+  let permitted = true;
+  const resumed = new InputPreparationService({ ...deps, createImagePreview: async () => {
+    permitted = false; throw new Error('thumbnail failed');
+  } });
+  const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  try {
+    await expect(resumed.executionOptions(prepared, () => { if (!permitted) throw new Error('permit revoked'); })).rejects.toThrow('permit revoked');
+  } finally { warning.mockRestore(); }
 });

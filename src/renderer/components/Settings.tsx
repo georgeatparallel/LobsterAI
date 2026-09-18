@@ -1,4 +1,4 @@
-import { ArchiveBoxIcon, ArrowPathIcon, ArrowPathRoundedSquareIcon, ChatBubbleLeftIcon, CheckCircleIcon, ComputerDesktopIcon, CpuChipIcon, CubeIcon, EnvelopeIcon, ExclamationTriangleIcon, GlobeAltIcon, InformationCircleIcon, MagnifyingGlassIcon, SignalIcon, SunIcon, TrashIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { ArchiveBoxIcon, ArrowPathIcon, ArrowPathRoundedSquareIcon, ChatBubbleLeftIcon, CheckCircleIcon, CpuChipIcon, CubeIcon, EnvelopeIcon, ExclamationTriangleIcon, GlobeAltIcon, InformationCircleIcon, MagnifyingGlassIcon, SignalIcon, SunIcon, TrashIcon, WrenchScrewdriverIcon, XMarkIcon } from '@heroicons/react/24/outline';
 import React, { useCallback,useEffect, useMemo, useRef, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 
@@ -69,8 +69,10 @@ import EditIcon from './icons/EditIcon';
 import MessageCopyIcon from './icons/MessageCopyIcon';
 import PlugIcon from './icons/PlugIcon';
 import PlusCircleIcon from './icons/PlusCircleIcon';
+import RemoteControlIcon from './icons/RemoteControlIcon';
 import IMSettings from './im/IMSettings';
 import PluginsSettings, { type PluginPendingChanges, type PluginsSettingsHandle } from './plugins/PluginsSettings';
+import { RemoteDeviceHelp } from './remote/RemoteDeviceHelp';
 import { RemoteDeviceSettings } from './remote/RemoteDeviceSettings';
 import BrowserWebAccessSettings from './settings/BrowserWebAccessSettings';
 import {
@@ -98,8 +100,10 @@ import {
   shouldUseOpenAIResponsesForProvider,
 } from './settings/modelProviderUtils';
 import ModelSettingsSection, { DeleteProviderConfirmDialog, ModelEditorDialog } from './settings/ModelSettingsSection';
+import { settingsDraftFingerprint } from './settings/settingsDraft';
 import { resolveSettingsEscapeAction, SettingsEscapeAction } from './settings/settingsEscape';
 import SettingsSwitch from './settings/SettingsSwitch';
+import SettingsUnsavedDialog from './settings/SettingsUnsavedDialog';
 import EmailSkillConfig from './skills/EmailSkillConfig';
 import SkinPresentationScope from './skin/SkinPresentationScope';
 import SkinSettingsSection from './skin/SkinSettingsSection';
@@ -1369,6 +1373,10 @@ const Settings: React.FC<SettingsProps> = ({
   } = useSkin();
   // 状态
   const [activeTab, setActiveTab] = useState<TabType>(initialTab ?? 'general');
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [unsavedDialogOpen, setUnsavedDialogOpen] = useState(false);
+  const initialDraftRef = useRef<string | null>(null);
+  const settingsFormRef = useRef<HTMLFormElement>(null);
   const [theme, setTheme] = useState<'light' | 'dark' | 'system'>('system');
   const [themeId, setThemeId] = useState<string>(themeService.getDefaultThemeId());
   const [uiFontSize, setUiFontSize] = useState<number>(FontPreferences.UiFontSizeDefault);
@@ -2187,6 +2195,7 @@ const Settings: React.FC<SettingsProps> = ({
         });
       }
 
+      setSettingsLoaded(true);
       // 加载快捷键设置
       if (config.shortcuts) {
         setShortcuts(prev => ({
@@ -2798,9 +2807,9 @@ const Settings: React.FC<SettingsProps> = ({
     }
   };
 
-  const hasCoworkConfigChanges = coworkAgentEngine !== coworkConfig.agentEngine
-    || coworkMemoryEnabled !== coworkConfig.memoryEnabled
-    || coworkMemoryLlmJudgeEnabled !== coworkConfig.memoryLlmJudgeEnabled
+  const hasCoworkConfigChanges = coworkAgentEngine !== (coworkConfig.agentEngine || 'openclaw')
+    || coworkMemoryEnabled !== (coworkConfig.memoryEnabled ?? true)
+    || coworkMemoryLlmJudgeEnabled !== (coworkConfig.memoryLlmJudgeEnabled ?? false)
     || skipMissedJobs !== (coworkConfig.skipMissedJobs ?? true)
     || openClawHeartbeatEnabled !== (coworkConfig.openClawHeartbeatEnabled ?? false)
     || openClawSkillReviewEnabled !== (coworkConfig.openClawSkillReviewEnabled ?? false)
@@ -2814,7 +2823,20 @@ const Settings: React.FC<SettingsProps> = ({
     || embeddingRemoteBaseUrl !== (coworkConfig.embeddingRemoteBaseUrl ?? '')
     || embeddingRemoteApiKey !== (coworkConfig.embeddingRemoteApiKey ?? '')
     || dreamingEnabled !== (coworkConfig.dreamingEnabled ?? false)
-    || dreamingFrequency !== (coworkConfig.dreamingFrequency ?? '0 3 * * *');
+    || dreamingFrequency !== (coworkConfig.dreamingFrequency ?? '0 3 * * *')
+    || dreamingModel !== (coworkConfig.dreamingModel ?? '')
+    || dreamingTimezone !== (coworkConfig.dreamingTimezone ?? '');
+  const draftFingerprint = settingsDraftFingerprint({
+    providers: normalizeProvidersForSettingsSave(providers), uiFontSize, codeFontSize, language,
+    artifactAutoPreviewEnabled, useSystemProxy, sqliteAutoBackupEnabled, usageAnalyticsEnabled,
+    taskCompletionNotificationMode, permissionNotificationsEnabled, questionNotificationsEnabled,
+    browserWebAccess, shortcuts, testMode,
+  });
+  useEffect(() => {
+    if (settingsLoaded && initialDraftRef.current === null) initialDraftRef.current = draftFingerprint;
+  }, [settingsLoaded, draftFingerprint]);
+  const hasDeferredSettingsChanges = settingsLoaded && (hasCoworkConfigChanges
+    || (initialDraftRef.current !== null && draftFingerprint !== initialDraftRef.current));
   const isOpenClawAgentEngine = coworkAgentEngine === 'openclaw';
 
   const openClawProgressPercent = useMemo(() => {
@@ -3724,14 +3746,14 @@ const Settings: React.FC<SettingsProps> = ({
     doTabChange(tab);
   }, [activeTab, doTabChange, isBackingUpOpenClawData, isRestoringOpenClawData]);
 
-  // Guarded close: check plugin dirty state before closing
   const guardedClose = useCallback(() => {
     if (isSaving || isBackingUpOpenClawData || isRestoringOpenClawData) return;
-    if (activeTab === 'plugins' && pluginsSettingsRef.current?.guardLeave(() => onClose())) {
+    if (hasDeferredSettingsChanges || pluginsSettingsRef.current?.getPendingChanges()) {
+      setUnsavedDialogOpen(true);
       return;
     }
     onClose();
-  }, [activeTab, isSaving, isBackingUpOpenClawData, isRestoringOpenClawData, onClose]);
+  }, [hasDeferredSettingsChanges, isSaving, isBackingUpOpenClawData, isRestoringOpenClawData, onClose]);
 
   const shortcutCommandMap = useMemo(
     () => new Map(SHORTCUT_COMMANDS.map(command => [command.key, command])),
@@ -4544,7 +4566,7 @@ const Settings: React.FC<SettingsProps> = ({
       { key: 'coworkAgentEngine' as TabType, label: i18nService.t('coworkAgentEngine'), icon: <CpuChipIcon className="h-5 w-5" /> },
       { key: 'model' as TabType,          label: i18nService.t('settingsCustomModel'), icon: <CubeIcon className="h-5 w-5" /> },
       { key: 'im' as TabType,             label: i18nService.t('imBot'),          icon: <ChatBubbleLeftIcon className="h-5 w-5" /> },
-      { key: 'remoteDevices' as TabType, label: i18nService.t('remoteDeviceManagement'), icon: <ComputerDesktopIcon className="h-5 w-5" /> },
+      { key: 'remoteDevices' as TabType, label: i18nService.t('remoteDeviceManagement'), icon: <RemoteControlIcon className="h-5 w-5" /> },
       { key: 'browserWebAccess' as TabType, label: i18nService.t('browserWebAccessTab'), icon: <GlobeAltIcon className="h-5 w-5" /> },
       { key: 'email' as TabType,          label: i18nService.t('emailTab'),       icon: <EnvelopeIcon className="h-5 w-5" /> },
       { key: 'coworkMemory' as TabType,   label: i18nService.t('coworkMemoryTitle'), icon: <BrainIcon className="h-5 w-5" /> },
@@ -6022,7 +6044,10 @@ const Settings: React.FC<SettingsProps> = ({
         <div className="relative flex-1 flex flex-col min-w-0 overflow-hidden bg-background rounded-r-2xl">
           {/* Content header */}
           <div className="flex justify-between items-center gap-3 px-6 pt-5 pb-3 shrink-0">
-            <h3 className="min-w-0 truncate text-lg font-semibold text-foreground">{activeTabLabel}</h3>
+            <div className="flex min-w-0 items-center gap-1.5">
+              <h3 className="min-w-0 truncate text-lg font-semibold text-foreground">{activeTabLabel}</h3>
+              {activeTab === 'remoteDevices' && <RemoteDeviceHelp />}
+            </div>
             <button
               onClick={guardedClose}
               className="text-secondary hover:text-foreground p-1.5 hover:bg-surface-raised rounded-lg transition-colors"
@@ -6049,7 +6074,7 @@ const Settings: React.FC<SettingsProps> = ({
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="flex flex-col flex-1 overflow-hidden">
+          <form ref={settingsFormRef} onSubmit={handleSubmit} className="flex flex-col flex-1 overflow-hidden">
             {/* Tab content */}
             <div
               ref={contentRef}
@@ -6059,8 +6084,8 @@ const Settings: React.FC<SettingsProps> = ({
               {renderTabContent()}
             </div>
 
-            {/* Footer buttons */}
-            <div className="relative shrink-0">
+            {/* Device actions are immediate; other form drafts survive tab navigation. */}
+            {activeTab !== 'remoteDevices' && <div className="relative shrink-0">
               <div
                 aria-hidden="true"
                 className={`pointer-events-none absolute inset-x-0 bottom-full h-10 bg-gradient-to-t from-background to-transparent transition-opacity duration-200 ${
@@ -6084,11 +6109,15 @@ const Settings: React.FC<SettingsProps> = ({
                   {isSaving ? i18nService.t('saving') : i18nService.t('save')}
                 </button>
               </div>
-            </div>
+            </div>}
           </form>
 
         </div>
 
+        <SettingsUnsavedDialog open={unsavedDialogOpen} busy={isSaving}
+          onContinue={() => setUnsavedDialogOpen(false)}
+          onDiscard={() => { setUnsavedDialogOpen(false); onClose(); }}
+          onSave={() => { setUnsavedDialogOpen(false); settingsFormRef.current?.requestSubmit(); }} />
         <ModelEditorDialog
           activeProvider={activeProvider}
           isAddingModel={isAddingModel}

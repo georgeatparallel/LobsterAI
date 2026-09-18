@@ -14,8 +14,10 @@ import type {
   KitReference,
   ResolvedKitCapabilities,
 } from '../../../shared/kit/constants';
+import type { LocalQuestionState, QuestionAnswers, QuestionDecisionOptions, QuestionDecisionOutcome, QuestionStatus } from '../../../shared/remote/questions';
 import type { SkinWorkflowKind } from '../../../shared/skin/constants';
 import type { CoworkMessage, CoworkSessionStatus } from '../../coworkStore';
+import type { QuestionRegistration } from '../../remote/remoteQuestionService';
 
 export type CoworkAgentEngine = 'openclaw';
 
@@ -197,6 +199,11 @@ export interface CoworkRuntime {
   closeSessionPermissions?(sessionId: string, runId: string | null, status?: 'cancelled' | 'expired' | 'superseded'): void;
   stopAllSessions(): void;
   respondToPermission(requestId: string, result: PermissionResult): void | Promise<void>;
+  registerQuestion?(input: QuestionRegistration): LocalQuestionState | null;
+  settleQuestion?(requestId: string, result: { status: Exclude<QuestionStatus, 'pending'>; answers?: QuestionAnswers }): void;
+  getQuestionState?(requestId: string): LocalQuestionState | null;
+  respondToQuestionConfirmed?(requestId: string, result: PermissionResult, options?: QuestionDecisionOptions): Promise<QuestionDecisionOutcome>;
+  reconcileQuestionSubmission?(submissionId: string): Promise<QuestionDecisionOutcome | null>;
   getPendingQuestions?(): Array<PermissionRequest & { sessionId: string }>;
   isSessionActive(sessionId: string): boolean;
   getSessionConfirmationMode(sessionId: string): 'modal' | 'text' | null;

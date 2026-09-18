@@ -168,3 +168,50 @@ describe('OpenClaw native questions', () => {
     expect(options.emitPermissionResolved).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('confirmed question responses for the shared arbiter', () => {
+  test('only a matching successful RPC produces a confirmed result', async () => {
+    const { controller, request } = setup(); const record = makeRecord(); controller.handleRequested(record);
+    request.mockResolvedValueOnce({ status: 'answered', answers: { answers: { choice: ['B'] } } });
+    expect(await controller.resolveConfirmed(record, { action: 'answer', answers: { choice: ['B'] } })).toMatchObject({ kind: 'confirmed', status: 'answered', answers: { choice: ['B'] } });
+  });
+  test.each([{ status: 'answered' }, { status: 'answered', answers: { answers: { choice: ['A (Recommended)'] } } }, { status: 'cancelled' }])('malformed or different RPC receipt stays unknown: %j', async response => {
+    const { controller, request } = setup(); const record = makeRecord(); controller.handleRequested(record);
+    request.mockResolvedValueOnce(response);
+    expect((await controller.resolveConfirmed(record, { action: 'answer', answers: { choice: ['B'] } })).kind).toBe('unknown');
+  });
+  test('receipt expiry and timeout never become successful answers or no-send proof', async () => {
+    const { controller, request } = setup(); const record = makeRecord(); controller.handleRequested(record);
+    request.mockRejectedValueOnce({ details: { reason: 'QUESTION_NOT_FOUND' } });
+    expect((await controller.resolveConfirmed(record, { action: 'cancel', answers: {} })).kind).toBe('unknown');
+    request.mockRejectedValueOnce(new Error('10-second timeout'));
+    expect((await controller.reconcileConfirmed(record)).kind).toBe('unknown');
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+  test('querying someone else’s terminal record never creates a confirmed submission receipt', async () => {
+    const { controller, request } = setup(); const record = makeRecord(); controller.handleRequested(record);
+    request.mockResolvedValueOnce({ question: { ...record, status: 'answered', answers: { answers: { choice: ['B'] } } } });
+    expect(await controller.reconcileConfirmed(record)).toMatchObject({ kind: 'unknown', status: 'answered', answers: { choice: ['B'] } });
+    request.mockResolvedValueOnce({ question: { ...record, sessionKey: 'another-session', status: 'answered', answers: { answers: { choice: ['B'] } } } });
+    expect(await controller.reconcileConfirmed(record)).toEqual({ kind: 'unknown', reason: 'QUESTION_RESULT_UNKNOWN' });
+  });
+  test('remote registration failures preserve the native prompt and local resolver', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const request = vi.fn().mockResolvedValue({ status: 'cancelled' }), show = vi.fn();
+    const controller = new OpenClawQuestionController({ getGatewayClient: () => ({ request }), resolveSessionId: () => 'desktop-1', isSessionStopped: () => false,
+      emitPermissionRequest: show, emitPermissionResolved: vi.fn(), onQuestion: () => { throw new Error('projection failed'); } });
+    controller.handleRequested(makeRecord());
+    expect(show).toHaveBeenCalledTimes(1);
+    await controller.respond(requestId(), { behavior: 'deny', message: 'cancel' });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+  test('disconnect suspends remote answering; a stop keeps its record until cancellation evidence arrives', async () => {
+    const request = vi.fn().mockResolvedValue({ status: 'cancelled' }), onUnavailable = vi.fn(), onSettled = vi.fn(); const client = { request };
+    const controller = new OpenClawQuestionController({ getGatewayClient: () => client, resolveSessionId: () => 'desktop-1', isSessionStopped: () => false,
+      emitPermissionRequest: vi.fn(), emitPermissionResolved: vi.fn(), onUnavailable, onSettled });
+    controller.handleRequested(makeRecord()); controller.disconnect();
+    expect(onUnavailable).toHaveBeenCalledWith(requestId());
+    controller.handleRequested(makeRecord()); controller.cancelBySession('desktop-1'); await Promise.resolve();
+    expect(onSettled).toHaveBeenCalledWith(requestId(), { status: 'cancelled', answers: undefined });
+  });
+});

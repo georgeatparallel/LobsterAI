@@ -4,16 +4,17 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, expect, it, vi } from 'vitest';
 
+import type { RemoteAgentCatalogItem } from '../../shared/remote/constants';
 import { AgentOwnerStore } from '../agentOwnership';
 import { payloadHash } from './canonical';
-import { RemoteAgentCatalog } from './remoteAgentCatalog';
+import { RemoteAgentCatalog, RemoteAgentError } from './remoteAgentCatalog';
 import { RemoteStore } from './remoteStore';
 
 const owner = { userId: '1001', scopeKey: 'personal' };
 const other = { userId: '1002', scopeKey: 'personal' };
 const dispose: Array<() => void> = [];
 afterEach(() => { for (const cleanup of dispose.splice(0).reverse()) cleanup(); });
-function fixture() {
+function fixture(getDefaultInput?: () => RemoteAgentCatalogItem['defaultInput']) {
   const directory = mkdtempSync(join(tmpdir(), 'remote-agent-catalog-'));
   const db = new Database(':memory:');
   dispose.push(() => { db.close(); rmSync(directory, { recursive: true, force: true }); });
@@ -28,7 +29,7 @@ function fixture() {
     ownership.assignNew(id, actor);
   });
   const paths: Record<string, string> = { main: directory, mine: directory };
-  const catalog = new RemoteAgentCatalog(store, ownership, agentId => ({ path: paths[agentId], name: 'Workspace' }));
+  const catalog = new RemoteAgentCatalog(store, ownership, agentId => ({ path: paths[agentId], name: 'Workspace' }), getDefaultInput);
   return { db, store, ownership, catalog, directory, paths };
 }
 it('publishes only main and the current owner, sanitizes icons, and keeps anonymous Agent session summaries', async () => {
@@ -168,4 +169,104 @@ it('renaming an Agent emits only its session summary without scanning existing m
   expect(added).toHaveLength(1);
   expect(added[0]).toMatchObject({ eventType: 'session.upsert', payload: { session: { preview: 'Existing conversation', agent: { name: 'Renamed' } } } });
   read.mockRestore();
+});
+
+
+it('advances the Agent version when default model or thinking settings change and keeps unchanged refreshes stable', async () => {
+  let defaults: RemoteAgentCatalogItem['defaultInput'] = { modelRef: null, modelVersion: null, thinkingLevel: null };
+  const { catalog } = fixture(() => defaults);
+  const first = await catalog.refresh(owner, 'device', () => true);
+  defaults = { modelRef: 'model', modelVersion: '2', thinkingLevel: 'high' };
+  const changed = await catalog.refresh(owner, 'device', () => true);
+  expect(BigInt(changed[0].version)).toBe(BigInt(first[0].version) + 1n);
+  expect(changed[0].defaultInput).toEqual(defaults);
+  expect(await catalog.refresh(owner, 'device', () => true)).toEqual(changed);
+  defaults = { ...defaults, thinkingLevel: 'low' };
+  const thinkingChanged = await catalog.refresh(owner, 'device', () => true);
+  expect(BigInt(thinkingChanged[0].version)).toBe(BigInt(changed[0].version) + 1n);
+});
+
+it('migrates the old workspace-only fingerprint once before publishing default input', async () => {
+  const { catalog, store, ownership, directory } = fixture(() => ({ modelRef: 'model', modelVersion: '2', thinkingLevel: 'high' }));
+  store.put('agentWorkspaceState:main', payloadHash({ path: directory, available: true }));
+  const before = ownership.get('main')!.version;
+  const first = await catalog.refresh(owner, 'device', () => true);
+  expect(BigInt(first[0].version)).toBe(BigInt(before) + 1n);
+  expect(await catalog.refresh(owner, 'device', () => true)).toEqual(first);
+});
+
+async function rejectedPublicationFixture() {
+  let defaults: RemoteAgentCatalogItem['defaultInput'] = { modelRef: null, modelVersion: null, thinkingLevel: null };
+  const data = fixture(() => defaults);
+  const server = { current: { deviceId: 'device', catalogVersion: '0', lastPublicationId: null as string | null,
+    syncStatus: 'pending', items: [] as RemoteAgentCatalogItem[] }, puts: [] as any[] };
+  const api = vi.fn(async (_path: string, method?: string, body?: any) => {
+    if (method !== 'PUT') return structuredClone(server.current);
+    server.puts.push(structuredClone(body));
+    for (const item of body.items as RemoteAgentCatalogItem[]) {
+      const before = server.current.items.find(value => value.agentId === item.agentId);
+      if (before && (before.kind !== item.kind || BigInt(item.version) < BigInt(before.version)
+        || item.version === before.version && payloadHash(item) !== payloadHash(before))) {
+        throw new RemoteAgentError(47029, 'AGENT_VERSION_CONFLICT', 'VERSION_REUSED');
+      }
+    }
+    server.current = { ...server.current, catalogVersion: String(BigInt(server.current.catalogVersion) + 1n),
+      lastPublicationId: body.publicationId, syncStatus: 'ready', items: body.items };
+    return { deviceId: 'device', publicationId: body.publicationId, catalogVersion: server.current.catalogVersion };
+  });
+  await data.catalog.publish(owner, 'device', '1', api, () => true);
+  defaults = { modelRef: 'model', modelVersion: '2', thinkingLevel: 'high' };
+  const entry = data.store.entries<any>('agentCatalog:')[0];
+  const pending = { publicationId: 'legacy-publication', expectedCatalogVersion: entry.value.catalogVersion,
+    items: entry.value.syncedItems.map((item: RemoteAgentCatalogItem) => ({ ...item, defaultInput: defaults })) };
+  data.store.put(entry.key, { ...entry.value, pending });
+  return { ...data, server, api, pending, key: entry.key };
+}
+
+it('retires a definitively rejected same-version publication and publishes fresh versions with a new immutable ID', async () => {
+  const { catalog, store, api, pending, key, server } = await rejectedPublicationFixture();
+  const original = structuredClone(pending);
+  await expect(catalog.publish(owner, 'device', '2', api, () => true)).rejects.toThrow('AGENT_VERSION_CONFLICT');
+  expect(store.get<any>(key).pending).toBeNull();
+  expect(server.current.catalogVersion).toBe('1');
+  await catalog.publish(owner, 'device', '2', api, () => true);
+  expect(server.puts).toHaveLength(3);
+  expect(server.puts[1]).toEqual({ ...original, connectionGeneration: '2' });
+  expect(server.puts[2].publicationId).not.toBe(original.publicationId);
+  expect(server.puts[2].expectedCatalogVersion).toBe('1');
+  expect(BigInt(server.puts[2].items[0].version)).toBeGreaterThan(BigInt(original.items[0].version));
+  expect(server.puts[2].items[0].defaultInput).toEqual(original.items[0].defaultInput);
+  expect(store.get<any>(key).pending).toBeNull();
+  expect(catalog.isSynced(owner, 'device', 'main')).toBe(true);
+});
+
+it.each(['identity', 'rollback'] as const)('does not repair a rejected publication with a server %s conflict', async conflict => {
+  const { catalog, store, api, pending, key, server, ownership } = await rejectedPublicationFixture();
+  const main = server.current.items[0];
+  if (conflict === 'identity') main.kind = 'owned';
+  else main.version = String(BigInt(main.version) + 1n);
+  const before = ownership.get('main')!.version;
+  await expect(catalog.publish(owner, 'device', '2', api, () => true)).rejects.toThrow('AGENT_VERSION_CONFLICT');
+  expect(store.get<any>(key).pending).toEqual(pending);
+  expect(ownership.get('main')!.version).toBe(before);
+});
+
+it('keeps the rejected publication when the confirming GET fails or the account changes', async () => {
+  const { catalog, store, api, pending, key, ownership } = await rejectedPublicationFixture();
+  const before = ownership.get('main')!.version;
+  let gets = 0;
+  const offline = async (path: string, method?: string, body?: any) => {
+    if (method !== 'PUT' && ++gets === 2) throw new Error('Offline');
+    return api(path, method, body);
+  };
+  await expect(catalog.publish(owner, 'device', '2', offline, () => true)).rejects.toThrow('Offline');
+  expect(store.get<any>(key).pending).toEqual(pending);
+  let current = true; gets = 0;
+  const switched = async (path: string, method?: string, body?: any) => {
+    if (method !== 'PUT' && ++gets === 2) current = false;
+    return api(path, method, body);
+  };
+  await expect(catalog.publish(owner, 'device', '2', switched, () => current)).rejects.toThrow('Account changed');
+  expect(store.get<any>(key).pending).toEqual(pending);
+  expect(ownership.get('main')!.version).toBe(before);
 });

@@ -181,15 +181,15 @@ describe('remote sync persistence logging', () => {
     });
     const before = store.sync('sync-task')!;
     const pending = store.pending('sync-task');
-    if (failureAt === 'ack') await expect(bridge.syncSessions()).rejects.toThrow('Remote ACK outside durable local bounds');
-    else await bridge.syncSessions();
+    // A malformed import receipt pauses that session without failing the independent control lane.
+    await bridge.syncSessions();
     expect(store.sync('sync-task')!.ack_seq).toBe(before.ack_seq);
     expect(store.sync('sync-task')!.needs_snapshot).toBe(1);
     expect(store.pending('sync-task')).toEqual(pending);
     expect(store.get('import:sync-task')).not.toBeNull();
     expect(debug.mock.calls.some(([message]) => message === '[RemoteSync] Snapshot acknowledged locally')).toBe(false);
     expect(warning.mock.calls.find(([message]) => message === '[RemoteSync] Session synchronization failed')![1])
-      .toMatchObject({ localSessionId: 'sync-task', phase: 'snapshot', ...(failureAt === 'ack' ? { validation: 'Remote ACK outside durable local bounds' } : {}) });
+      .toMatchObject({ localSessionId: 'sync-task', phase: 'snapshot', ...(failureAt === 'ack' ? { validation: 'Remote import receipt identity mismatch' } : {}) });
     if (failureAt === 'part') expect(request.mock.calls.some(call => call[1].endsWith('/commit'))).toBe(false);
     expect(JSON.stringify([...debug.mock.calls, ...warning.mock.calls])).not.toContain(privateText);
   });

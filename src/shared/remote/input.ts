@@ -37,3 +37,9 @@ export interface RemotePreparationClaim {
   preparationId: string; request: RemoteInputRequest; statusVersion: string; claimId: string; claimToken: string;
   claimUntil: string; grantVersion?: string; expiresAt?: string; attachments?: RemoteInputAsset[];
 }
+
+/** Only schema version 2 carries a durable dispatch boundary. Legacy fences remain unknown. */
+export const RemoteInputOperationPhase = {
+  Prepared: 'prepared', Dispatched: 'dispatched', Confirmed: 'confirmed',
+  KnownNotApplied: 'known_not_applied', Unknown: 'unknown',
+} as const;

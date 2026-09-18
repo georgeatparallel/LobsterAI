@@ -11,6 +11,8 @@ const eventTypes = new Set(['session.upsert', 'session.deleted', 'message.upsert
 const lifecycleStates = new Set(['starting', 'running', 'waiting_approval', 'waiting_local', 'cancelling', 'reconciling', 'succeeded', 'failed', 'cancelled', 'interrupted', 'pending', 'approved', 'rejected', 'expired', 'streaming', 'complete', 'error', 'queued', 'waiting_user', 'unavailable', 'uploading', 'committed', 'aborted']);
 const validationMessages = new Set([
   'Remote ACK outside durable local bounds', 'Remote batch ACK identity mismatch',
+  'Remote import receipt identity mismatch', 'Import receipt identity mismatch', 'Import abortion is not confirmed',
+  'REMOTE_IMPORT_BUDGET', 'REMOTE_IMPORT_RECORD_LIMIT', 'REMOTE_IMPORT_PART_UNAVAILABLE', 'REMOTE_IMPORT_CONTEXT_CHANGED',
   'Import changed the fixed remote session mapping', 'Remote response is too large',
   'Invalid remote response', 'Remote payload must contain finite JSON values',
   'Account changed during remote request', 'Account changed during remote response',

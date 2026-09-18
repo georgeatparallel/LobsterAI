@@ -197,6 +197,7 @@ import {
   parseModelThinkingLevel,
   ProviderName,
 } from '../shared/providers';
+import type { RemoteConnectionOperationRequest, RemoteConnectionRemoveRequest, RemoteConnectionResumeRequest, RemoteConnectionsRequest } from '../shared/remote/connections';
 import { type RemoteConfigureRequest, RemoteIpc, type RemoteOwner, type RemoteSettingsState } from '../shared/remote/constants';
 import {
   ShareDeploymentCandidateSource,
@@ -593,8 +594,12 @@ import { captureDesktopInput } from './remote/desktopInputMetadata';
 import { InputPreparationService } from './remote/inputPreparationService';
 import { createRemoteDatabaseFence,loadRemoteIdentity } from './remote/installationIdentity';
 import { RemoteBridge } from './remote/remoteBridge';
+import { withRemoteConnectionAccount } from './remote/remoteConnectionIpc';
 import { listRemoteInputModels } from './remote/remoteInputModels';
+import { RemoteLocalGc } from './remote/remoteLocalGc';
 import { RemoteModelCatalog } from './remote/remoteModelCatalog';
+import { RemoteSecurityCoordinator } from './remote/remoteSecurityCoordinator';
+import { RemoteSecurityJournal, RemoteSecurityJournalWorkerIo } from './remote/remoteSecurityJournal';
 import { PREVENT_SLEEP_STORE_KEY, RemoteSettingsController } from './remote/remoteSettingsController';
 import { assertRemoteExecutionPermit,currentRemoteExecution, markRemoteExecutionDispatched, SessionCommandService } from './remote/sessionCommandService';
 import { SkillManager } from './skills/skillManager';
@@ -3834,6 +3839,8 @@ const getMcpRuntime = (): McpRuntime => {
       permissionSessions: coworkPermissionSessions,
       getStore,
       syncOpenClawConfig,
+      registerQuestion: request => getCoworkEngineRouter().registerQuestion?.(request) ?? null,
+      settleQuestion: (requestId, result) => getCoworkEngineRouter().settleQuestion?.(requestId, result),
       onAskUserRequested: (sessionId, request) => {
         getDesktopNotificationManager().handlePermissionRequest(sessionId, request);
       },
@@ -5263,6 +5270,7 @@ if (!gotTheLock) {
   // ── Auth IPC handlers ──
 
   let remoteBridge: RemoteBridge | null = null;
+  let remoteLocalGc: RemoteLocalGc | null = null;
   let remoteSessionCommands: SessionCommandService | null = null;
   let ownershipAssociations: OwnershipAssociationService | null = null;
   const ownershipBootId = crypto.randomUUID();
@@ -5649,7 +5657,9 @@ if (!gotTheLock) {
     if (remoteBridge) return remoteBridge;
     const identity = loadRemoteIdentity(app.getPath('appData'), app.getPath('userData'), safeStorage);
     const fence = createRemoteDatabaseFence(app.getPath('appData'), app.getPath('userData'), safeStorage, identity);
-    getCoworkStore().remote.validateDatabaseInstance(identity.databaseId, fence.checkpoint, fence.advance);
+    const profile = crypto.createHash('sha256').update(fs.realpathSync(app.getPath('userData'))).digest('hex');
+    const journal = new RemoteSecurityJournal(identity, new RemoteSecurityJournalWorkerIo(path.join(app.getPath('appData'), 'LobsterAI-remote-identity', profile, 'security-v1')), gotTheLock);
+    const security = new RemoteSecurityCoordinator(getCoworkStore().remote, journal, identity, fence.checkpoint);
     const models = new RemoteModelCatalog(getCoworkStore().remote, () => listRemoteInputModels({
       token: getAuthTokens()?.accessToken || null, baseURL: getServerApiBaseUrl(),
     }));
@@ -5657,6 +5667,13 @@ if (!gotTheLock) {
       store: getCoworkStore(), models, cacheRoot: path.join(app.getPath('userData'), 'remote-inputs'),
       getOwner: getCurrentRemoteOwner, getDefaultModel: resolveDefaultAgentModelRef,
       getAgentCatalog: () => remoteBridge?.getInputAgentCatalog() || null,
+      createImagePreview: async filePath => {
+        const thumbnail = await nativeImage.createThumbnailFromPath(filePath, { width: 256, height: 256 });
+        const size = thumbnail.getSize();
+        if (thumbnail.isEmpty() || size.width > 512 || size.height > 512) return undefined;
+        const jpeg = thumbnail.toJPEG(70);
+        return { mimeType: 'image/jpeg', base64Data: jpeg.toString('base64') };
+      },
       convertImage: async (filePath, _mimeType, targetPath) => {
         const decoded = nativeImage.createFromPath(filePath);
         if (decoded.isEmpty()) throw new Error('INPUT_UNSUPPORTED');
@@ -5666,6 +5683,7 @@ if (!gotTheLock) {
     });
     remoteSessionCommands!.configureInput({ models, preparations, getDeviceId: () => remoteBridge?.state().deviceId });
     remoteBridge = new RemoteBridge({
+      security,
       input: { models, preparations },
       files: { cacheRoot: path.join(app.getPath('userData'), 'remote-file-uploads'), access: filePath => captureLibraryFileAccess(filePath) },
       getAgentDefaultInput: (owner, deviceId, agentId) => {
@@ -5710,6 +5728,8 @@ if (!gotTheLock) {
       runSessionTransaction: operation => getCoworkStore().runSessionTransaction(operation),
       prepare: (command, owner, workspace) => remoteSessionCommands!.prepare(command, owner, workspace),
       execute: (entry, stillPermitted) => remoteSessionCommands!.execute(entry, stillPermitted),
+      supportsQuestions: () => typeof getCoworkEngineRouter().respondToQuestionConfirmed === 'function',
+      reconcileQuestion: entry => remoteSessionCommands!.reconcileQuestion(entry),
       supportsDualApproval: () => getCoworkEngineRouter().supportsDualApproval?.() === true,
       configureDualApproval: options => getCoworkEngineRouter().configureDualApproval?.(options),
       reconcileApproval: entry => remoteSessionCommands!.reconcileApproval(entry),
@@ -5730,6 +5750,16 @@ if (!gotTheLock) {
       owner, workspaces: [], accessRequests: [], error: owner ? t('remoteSecureStorageUnavailable') : undefined };
   };
   ipcMain.handle(RemoteIpc.State, () => remoteSettingsController?.state() ?? readRemoteState());
+  const connectionAccount = { getAccountEpoch: getRemoteAccountEpoch, getOwner: getCurrentRemoteOwner };
+  ipcMain.handle(RemoteIpc.Connections, (_event, input: RemoteConnectionsRequest) => withRemoteConnectionAccount(input, connectionAccount,
+    () => initializeRemoteBridge().queryConnections()));
+  ipcMain.handle(RemoteIpc.RemoveConnection, (_event, input: RemoteConnectionRemoveRequest) => withRemoteConnectionAccount(input, connectionAccount,
+    () => initializeRemoteBridge().removeConnection(input)));
+  ipcMain.handle(RemoteIpc.ResumeConnection, (_event, input: RemoteConnectionResumeRequest) => withRemoteConnectionAccount(input, connectionAccount,
+    () => initializeRemoteBridge().resumeCurrentConnection(input)));
+  ipcMain.handle(RemoteIpc.ConnectionOperation, (_event, input: RemoteConnectionOperationRequest) => withRemoteConnectionAccount(input, connectionAccount,
+    () => initializeRemoteBridge().queryConnectionOperation(input.requestId)));
+
   ipcMain.handle(RemoteIpc.Configure, (_event, input: RemoteConfigureRequest) => configureRemoteSettings(input, {
     getAccountEpoch: getRemoteAccountEpoch,
     getOwner: getCurrentRemoteOwner,
@@ -5748,6 +5778,12 @@ if (!gotTheLock) {
   const initializeRemoteControl = (): void => {
     // Store-backed services and listeners must wait for initApp's database initialization.
     getCoworkStore().remoteCreationOwner = getCurrentRemoteOwner;
+    try {
+      remoteLocalGc ??= new RemoteLocalGc({ store: getCoworkStore().remote,
+        cacheRoot: path.join(app.getPath('userData'), 'remote-file-uploads'), inputCacheRoot: path.join(app.getPath('userData'), 'remote-inputs'), owner: getCurrentRemoteOwner,
+        enabled: () => !getCoworkStore().remote.needsSecurityRecovery() });
+      remoteLocalGc.start();
+    } catch { console.warn('[RemoteGc] Background cache maintenance unavailable'); }
     remoteSessionCommands = new SessionCommandService(getCoworkStore(), getCoworkEngineRouter(), getCurrentRemoteOwner,
       { getGeneration: () => `${ownershipAccountEpoch}:${authAccountGeneration}`, onRecovered: sessionId => {
         if (!getCoworkStore().canReadSession(sessionId, getCurrentRemoteOwner())) return;
@@ -9501,6 +9537,7 @@ if (!gotTheLock) {
       const inputModel = remoteSessionCommands?.recordCurrentInputModel(sessionId) || null;
       if (captured) getCoworkStore().remote.put(`desktopInputRun:${runId}`, { ...captured, inputModel });
       else if (inputModel) getCoworkStore().remote.put(`desktopInputRun:${runId}`, { owner, text: options.prompt, attachments: [], inputModel });
+      if (captured || inputModel) getCoworkStore().remote.markFilesDirty(sessionId);
     }
   };
 
@@ -9690,7 +9727,7 @@ if (!gotTheLock) {
           imageAttachmentPreviews,
         });
         if (!execution?.runId) coworkStoreInstance.remote.beginRun(session.id);
-        await recordDesktopInput(session.id, options);
+        void recordDesktopInput(session.id, options).catch(error => console.warn('[RemoteFiles] Input synchronization deferred', error));
         assertRemoteExecutionPermit();
         coworkStoreInstance.addMessage(session.id, {
           type: 'user',
@@ -9825,7 +9862,7 @@ if (!gotTheLock) {
         coworkStoreInstance.remote.assertActor(options.sessionId, execution?.owner ?? null);
         if (execution?.owner && !sameOwner(execution.owner, getCurrentRemoteOwner())) throw new Error('Account changed');
         if (!execution?.runId) coworkStoreInstance.remote.beginRun(options.sessionId);
-        await recordDesktopInput(options.sessionId, options);
+        void recordDesktopInput(options.sessionId, options).catch(error => console.warn('[RemoteFiles] Input synchronization deferred', error));
         assertRemoteExecutionPermit();
         const config = coworkStoreInstance.getConfig();
         const hasLegacyPersistedPlanMode = containsPlanModePrompt(existingSession?.systemPrompt);
@@ -14694,6 +14731,7 @@ if (!gotTheLock) {
     const cleanupStartedAt = Date.now();
     console.log(`[Main] App cleanup started for ${reason}`);
     currentAppCleanupStep = 'sync-teardown';
+    remoteLocalGc?.stop();
     remoteBridge?.stop();
     remoteSettingsController?.dispose();
     skillManager?.stopWatching();

@@ -35,7 +35,7 @@ const connected: RemoteSettingsState = {
 const render = (loginAllowed = true) => {
   const onClose = vi.fn(); const onLogin = vi.fn();
   const html = renderToStaticMarkup(React.createElement(RemoteControlPopover, {
-    anchorRef: React.createRef<HTMLButtonElement>(), onClose, onLogin, loginAllowed,
+    anchorRef: React.createRef<HTMLButtonElement>(), onClose, onLogin, loginAllowed, onOpenDeviceManagement: vi.fn(),
   }));
   return { html, onClose, onLogin };
 };
@@ -139,6 +139,14 @@ describe('mobile connection popover', () => {
     expect(html).toContain(i18nService.t('remoteKeepAwakeFailed'));
     expect(html).not.toContain(i18nService.t('remoteReconnect'));
     expect(html).not.toContain('Power API error');
+  });
+
+  test('quota failure adds a management link without exposing device metadata', () => {
+    harness.snapshot.state = { ...connected, connected: false, errorCode: 47022 };
+    const { html } = render();
+    expect(html).toContain(i18nService.t('remoteQuotaAttention'));
+    expect(html).toContain(i18nService.t('remoteDeviceManagement'));
+    expect(html).not.toContain('Private alias');
   });
 
   test('uncertain persistence still gets an explicit retry message', () => {

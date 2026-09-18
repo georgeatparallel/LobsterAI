@@ -103,6 +103,7 @@ import { OwnershipIpc } from '../shared/ownership/constants';
 import type { OwnershipCommitRequest, OwnershipTarget } from '../shared/ownership/types';
 import { PermissionIpcChannel } from '../shared/permissions/constants';
 import type { Platform } from '../shared/platform';
+import type { RemoteConnectionOperationRequest, RemoteConnectionRemoveRequest, RemoteConnectionResumeRequest, RemoteConnectionsRequest } from '../shared/remote/connections';
 import { type RemoteConfigureRequest, RemoteIpc, type RemoteSettingsState } from '../shared/remote/constants';
 import {
   type ShareDeploymentAnalyzeProjectInput,
@@ -152,6 +153,10 @@ contextBridge.exposeInMainWorld('electron', {
   },
   remote: {
     state: () => ipcRenderer.invoke(RemoteIpc.State),
+    queryConnections: (input: RemoteConnectionsRequest) => ipcRenderer.invoke(RemoteIpc.Connections, input),
+    removeConnection: (input: RemoteConnectionRemoveRequest) => ipcRenderer.invoke(RemoteIpc.RemoveConnection, input),
+    resumeCurrentConnection: (input: RemoteConnectionResumeRequest) => ipcRenderer.invoke(RemoteIpc.ResumeConnection, input),
+    queryConnectionOperation: (input: RemoteConnectionOperationRequest) => ipcRenderer.invoke(RemoteIpc.ConnectionOperation, input),
     onChanged: (listener: (state: RemoteSettingsState) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, state: RemoteSettingsState) => listener(state);
       ipcRenderer.on(RemoteIpc.Changed, handler);

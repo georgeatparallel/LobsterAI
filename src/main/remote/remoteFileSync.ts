@@ -5,7 +5,8 @@ import path from 'path';
 import type { RemoteOwner } from '../../shared/remote/constants';
 import { type RemoteArtifactManifest, type RemoteFilePolicy, RemoteFileReason, remoteFileRule } from '../../shared/remote/files';
 import type { RemoteInputAsset } from '../../shared/remote/input';
-import { sameOwner } from './canonical';
+import { sameOwner, stableJson } from './canonical';
+import { projectRemoteArtifacts, remoteArtifactReasons } from './remoteArtifactProjection';
 import { type DesktopMessageAssetJob, uploadDesktopMessageAsset } from './remoteDesktopAssetUpload';
 import { captureRemoteFileSnapshot, remoteFileCacheDirectory, type RemoteFileSnapshot, verifyRemoteFileSnapshot } from './remoteFileSnapshots';
 import type { RemoteStore } from './remoteStore';
@@ -27,7 +28,7 @@ interface ArtifactJob {
   reason?: string; retryAt?: number;
 }
 interface InputJob extends DesktopMessageAssetJob {
-  localSessionId: string; snapshot?: RemoteFileSnapshot; availability: string; uploadedAsset?: RemoteInputAsset; reason?: string; retryAt?: number;
+  localSessionId: string; snapshot?: RemoteFileSnapshot; availability: string; uploadedAsset?: RemoteInputAsset; reason?: string; retryAt?: number; captureReason?: string;
   environment?: string;
 }
 interface Connection { owner: RemoteOwner; environment: string; deviceId: string; generation: string }
@@ -35,6 +36,8 @@ interface TerminalBoundary { owner: RemoteOwner; environment: string; deviceId: 
 export interface RemoteFileSyncDependencies {
   store: RemoteStore; cacheRoot: string; owner(): RemoteOwner | null; environment(): string; enabled(): boolean;
   access(filePath: string): { assertAllowed(): void };
+  /** Only an already sealed producer version may be pinned to a completed run. Must not perform file I/O here. */
+  terminalSnapshot?(source: Source): { snapshot: RemoteFileSnapshot; runId: string; artifactId: string; producerRevision: string } | null;
   request(connection: Connection, pathname: string, init: RequestInit): Promise<Response>;
 }
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
@@ -47,9 +50,7 @@ const mimeTypes: Record<string, string> = { md: 'text/markdown', txt: 'text/plai
 const mime = (name: string): string => mimeTypes[path.extname(name).slice(1).toLowerCase()] || 'text/plain';
 const escapeId = (value: string): string => encodeURIComponent(value);
 const durableJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-const projectedReasons = new Set(['FILE_TOO_LARGE', 'FILE_TYPE_NOT_ALLOWED', 'FILE_CONTENT_INVALID', 'ARTIFACT_COUNT_LIMIT', 'TASK_FILE_QUOTA_EXCEEDED',
-  'ACCOUNT_FILE_QUOTA_EXCEEDED', 'ACCOUNT_FILE_COUNT_LIMIT', 'UPLOAD_DAILY_QUOTA_EXCEEDED', 'FILE_SOURCE_CHANGED', 'FILE_TRANSFER_BUSY',
-  'NOS_PRIVATE_STORAGE_UNAVAILABLE', 'FINAL_SNAPSHOT_UNAVAILABLE', 'FILE_MISSING']);
+
 
 /** One account-bound scheduler; persisted snapshots survive HTTP/WS and process restarts. */
 export class RemoteFileSync {
@@ -60,13 +61,19 @@ export class RemoteFileSync {
   private cleanupAt = 0;
   private work: Promise<void> | null = null;
   private enabled = false;
+  private fileHealth: { degraded: boolean; pending: number | null } = { degraded: false, pending: null };
+  health(): { degraded: boolean; pending: number | null } { return { ...this.fileHealth }; }
+  private observationCursor = 0;
+  private coldObservationAt = new Map<string, number>();
   constructor(private readonly deps: RemoteFileSyncDependencies) {
     deps.store.setArtifactProjectionResolver((sessionId, messageId) => this.projection(sessionId, messageId));
     deps.store.setFileTerminalBoundary((sessionId, runId) => this.captureTerminal(sessionId, runId));
   }
   configure(enabled: boolean): void { this.enabled = enabled; if (!enabled) this.pause(); }
-  canCaptureInput(): boolean { return this.enabled && this.deps.enabled() && this.policy?.features.desktopInputSync === true; }
-  pause(): void { this.connection = null; this.policy = null; this.policyAt = 0; this.policyRetryAt = 0; }
+  // Capture sealed send-time bytes before the asynchronous file policy arrives. Upload still waits for policy admission.
+  canCaptureInput(): boolean { return this.enabled && this.deps.enabled() && this.deps.owner() !== null; }
+  private canUploadInput(): boolean { return this.canCaptureInput() && this.policy?.features.desktopInputSync === true; }
+  pause(): void { this.fileHealth = { degraded: false, pending: null }; this.connection = null; this.policy = null; this.policyAt = 0; this.policyRetryAt = 0; }
   private prefix(connection: Connection): string {
     return `fileOutput:${createHash('sha256').update(JSON.stringify([connection.environment, connection.owner, connection.deviceId])).digest('hex')}:`;
   }
@@ -80,12 +87,14 @@ export class RemoteFileSync {
     if (!this.enabled) return;
     if (!this.connection || !sameOwner(this.connection.owner, connection.owner) || this.connection.environment !== connection.environment
       || this.connection.deviceId !== connection.deviceId || this.connection.generation !== connection.generation) {
-      this.policy = null; this.policyAt = 0; this.policyRetryAt = 0;
+      this.policy = null; this.policyAt = 0; this.policyRetryAt = 0; this.fileHealth = { degraded: false, pending: null };
     }
     this.connection = connection;
     this.deps.store.setFileEnvironment(connection.environment);
     if (this.work) return;
-    const work = this.cycle(connection).catch(() => { /* Jobs retain bounded retry state, account changes stop I/O. */ }).finally(() => { if (this.work === work) this.work = null; });
+    const work = this.cycle(connection).catch(() => {
+      if (this.current(connection)) this.fileHealth = { degraded: true, pending: this.fileHealth.pending };
+    }).finally(() => { if (this.work === work) this.work = null; });
     this.work = work;
   }
   async settled(): Promise<void> { await this.work; }
@@ -114,12 +123,15 @@ export class RemoteFileSync {
       if (!Array.isArray(policy.types) || !policy.features || !policy.limits || !/^\d+$/u.test(policy.policyVersion)) return;
       this.policy = policy; this.policyAt = Date.now(); this.policyRetryAt = 0;
     }
-    if (Date.now() - this.cleanupAt > 3_600_000) { this.cleanupSnapshots(connection); this.cleanupAt = Date.now(); }
-    if (this.policy.features.desktopInputSync) await this.inputs(connection);
+    this.fileHealth = { degraded: false, pending: 0 };
+    if (Date.now() - this.cleanupAt > 3_600_000) { await this.cleanupSnapshots(connection); this.cleanupAt = Date.now(); }
+    if (this.canUploadInput()) await this.inputs(connection);
     if (!this.policy?.features.artifactPublish || !this.current(connection)) return;
-    this.observe(connection);
+    await this.observe(connection);
     for (const { key, value: job } of this.deps.store.entries<ArtifactJob>(this.prefix(connection))) {
       if (!this.current(connection, job.localSessionId)) return;
+      this.fileHealth.pending = (this.fileHealth.pending || 0) + job.queue.length + (job.rename ? 1 : 0);
+      if (job.reason) this.fileHealth.degraded = true;
       if ((!job.queue.length && !job.rename) || (job.retryAt || 0) > Date.now()) continue;
       try {
         if (job.rename && job.artifactId) {
@@ -135,16 +147,17 @@ export class RemoteFileSync {
       }
       catch (error) {
         if (!this.current(connection, job.localSessionId)) return;
+        this.fileHealth.degraded = true;
         job.reason = error instanceof Error ? error.message : RemoteFileReason.Transfer; job.retryAt = Date.now() + 60_000;
         this.save(key, job);
         if (job.artifactId) await this.json(connection, `/artifacts/${escapeId(job.artifactId)}/sync-state`, {
           operationId: randomUUID(), expectedRevision: job.revision, syncState: 'blocked',
-          reason: projectedReasons.has(job.reason) ? job.reason : RemoteFileReason.Transfer,
+          reason: remoteArtifactReasons.has(job.reason) ? job.reason : RemoteFileReason.Transfer,
         }, 'PUT').catch((): void => undefined);
       }
     }
   }
-  private cleanupSnapshots(connection: Connection): void {
+  private async cleanupSnapshots(connection: Connection): Promise<void> {
     this.assert(connection);
     const references = new Set<string>();
     for (const { value } of this.deps.store.entries<{ owner: RemoteOwner; attachments: Array<{ snapshot?: RemoteFileSnapshot }> }>('desktopInputRun:'))
@@ -153,13 +166,15 @@ export class RemoteFileSync {
     for (const { value } of this.deps.store.entries<ArtifactJob>('fileOutput:')) if (value.owner.userId === connection.owner.userId)
       for (const pending of value.queue) references.add(pending.snapshot.path);
     const accountRoot = path.dirname(remoteFileCacheDirectory(this.deps.cacheRoot, connection.owner));
-    if (!fs.existsSync(accountRoot)) return;
-    for (const scope of fs.readdirSync(accountRoot, { withFileTypes: true })) {
+    const scopes = await fs.promises.readdir(accountRoot, { withFileTypes: true }).catch((): fs.Dirent[] => []);
+    let scanned = 0;
+    for (const scope of scopes) {
       if (!scope.isDirectory() || !/^[a-f0-9]{64}$/u.test(scope.name)) continue;
-      for (const file of fs.readdirSync(path.join(accountRoot, scope.name), { withFileTypes: true })) {
+      for (const file of await fs.promises.readdir(path.join(accountRoot, scope.name), { withFileTypes: true })) {
+        if (++scanned > 4096) return;
         if (!file.isFile() || !/^[a-f0-9-]{36}$/u.test(file.name)) continue;
         const target = path.join(accountRoot, scope.name, file.name);
-        if (!references.has(target) && fs.statSync(target).mtimeMs < Date.now() - 86_400_000) { this.assert(connection); fs.rmSync(target, { force: true }); }
+        if (!references.has(target) && (await fs.promises.stat(target)).mtimeMs < Date.now() - 86_400_000) { this.assert(connection); await fs.promises.rm(target, { force: true }); }
       }
     }
   }
@@ -182,7 +197,10 @@ export class RemoteFileSync {
         if (BigInt(persisted.captureSequence) > BigInt(job.captureSequence)) job.captureSequence = persisted.captureSequence;
         job.references = { ...persisted.references, ...job.references };
       }
-      this.deps.store.put(key, durableJson(job)); this.deps.store.markFilesDirty(job.localSessionId);
+      const durable = durableJson(job);
+      // Observation of an unchanged file is not a new publication or a conversation change.
+      if (persisted && stableJson(persisted) === stableJson(durable)) return;
+      this.deps.store.put(key, durable); this.deps.store.markFilesDirty(job.localSessionId);
     });
   }
   private sources(sessionId: string, runId?: string): Source[] {
@@ -212,36 +230,66 @@ export class RemoteFileSync {
     }
     return { key, job };
   }
-  private capture(connection: Connection, source: Source, job: ArtifactJob, final: boolean): void {
-    if (!this.policy) throw new Error(RemoteFileReason.Final);
-    const lease = this.deps.access(source.file_path);
-    const assert = (): void => {
-      this.assert(connection, source.session_id); lease.assertAllowed();
-      const relation = this.deps.store.db.prepare('SELECT last_message_id FROM library_artifact_sessions WHERE artifact_id=? AND session_id=?').get(source.id, source.session_id) as { last_message_id: string } | undefined;
-      if (relation?.last_message_id !== source.message_id) throw new Error(RemoteFileReason.Source);
-      const stat = fs.statSync(source.file_path);
-      if (!source.file_identity || `${stat.dev}:${stat.ino}:${Math.trunc(stat.birthtimeMs)}` !== source.file_identity) throw new Error(RemoteFileReason.Source);
-    };
-    assert();
-    const reason = remoteFileRule(this.policy, source.file_name, String(fs.statSync(source.file_path).size), true);
-    if (reason) throw new Error(reason);
-    if (final && job.queue.filter(item => item.terminal).length >= 3) throw new Error(RemoteFileReason.Final);
-    if (!final && job.queue.length) return;
-    const snapshot = captureRemoteFileSnapshot(source.file_path, this.deps.cacheRoot, connection.owner, 30 * 1024 * 1024, assert);
+  private enqueueSnapshot(source: Source, job: ArtifactJob, snapshot: RemoteFileSnapshot, final: boolean): void {
     job.captureSequence = String(BigInt(job.captureSequence) + 1n);
     job.queue.push({ publicationId: randomUUID(), captureSequence: job.captureSequence, messageId: source.message_id, runId: source.run_id,
       fileName: path.basename(source.file_name), mimeType: mime(source.file_name), snapshot, terminal: final });
-    job.lastCaptureAt = Date.now(); job.dirtyAt = undefined; job.reason = undefined;
+    job.lastCaptureAt = Date.now(); job.dirtyAt = undefined;
+    if (job.reason !== RemoteFileReason.Final) job.reason = undefined;
   }
-  private observe(connection: Connection): void {
-    for (const row of this.deps.store.sessions(connection.owner)) {
+  private captureProducerVersion(connection: Connection, source: Source, job: ArtifactJob): boolean {
+    this.assert(connection, source.session_id);
+    const sealed = this.deps.terminalSnapshot?.(source);
+    if (!sealed) return false;
+    if (!this.policy || sealed.runId !== source.run_id || sealed.artifactId !== source.id || !sealed.producerRevision
+      || sealed.producerRevision.length > 128 || !sealed.snapshot.sha256 || job.queue.filter(item => item.terminal).length >= 3) throw new Error(RemoteFileReason.Final);
+    const reason = remoteFileRule(this.policy, source.file_name, sealed.snapshot.sizeBytes, true);
+    if (reason) throw new Error(reason);
+    this.enqueueSnapshot(source, job, sealed.snapshot, true);
+    return true;
+  }
+  private async capture(connection: Connection, source: Source, job: ArtifactJob): Promise<void> {
+    if (!this.policy) throw new Error(RemoteFileReason.Final);
+    if (job.queue.length) return;
+    const lease = this.deps.access(source.file_path);
+    const ordinal = this.deps.store.get<string>(`fileRunOrdinal:${source.session_id}`);
+    const assert = (): void => {
+      this.assert(connection, source.session_id); lease.assertAllowed();
+      const relation = this.deps.store.db.prepare('SELECT last_message_id FROM library_artifact_sessions WHERE artifact_id=? AND session_id=?').get(source.id, source.session_id) as { last_message_id: string } | undefined;
+      if (relation?.last_message_id !== source.message_id || this.deps.store.run(source.session_id)?.runId !== source.run_id
+        || this.deps.store.get<string>(`fileRunOrdinal:${source.session_id}`) !== ordinal) throw new Error(RemoteFileReason.Source);
+    };
+    assert();
+    const before = await fs.promises.stat(source.file_path);
+    if (!source.file_identity || `${before.dev}:${before.ino}:${Math.trunc(before.birthtimeMs)}` !== source.file_identity) throw new Error(RemoteFileReason.Source);
+    const reason = remoteFileRule(this.policy, source.file_name, String(before.size), true);
+    if (reason) throw new Error(reason);
+    const snapshot = await captureRemoteFileSnapshot(source.file_path, this.deps.cacheRoot, connection.owner, 30 * 1024 * 1024, assert);
+    try {
+      assert();
+      if (snapshot.identity !== `${before.dev}:${before.ino}:${before.size}:${before.mtimeMs}:${before.ctimeMs}`) throw new Error(RemoteFileReason.Source);
+      this.enqueueSnapshot(source, job, snapshot, false);
+    } catch (error) { await fs.promises.rm(snapshot.path, { force: true }); throw error; }
+  }
+  private async observe(connection: Connection): Promise<void> {
+    const rows = this.deps.store.sessions(connection.owner);
+    const offset = rows.length ? this.observationCursor % rows.length : 0;
+    const selected = [...rows.slice(offset), ...rows.slice(0, offset)].slice(0, 20);
+    this.observationCursor = rows.length ? (offset + selected.length) % rows.length : 0;
+    for (const row of selected) {
+      const activeRun = this.deps.store.run(row.local_id);
+      if (!activeRun || terminal.has(activeRun.status)) {
+        if ((this.coldObservationAt.get(row.local_id) ?? 0) > Date.now()) continue;
+        this.coldObservationAt.set(row.local_id, Date.now() + 60000);
+        if (this.coldObservationAt.size > 2000) this.coldObservationAt.delete(this.coldObservationAt.keys().next().value!);
+      }
       if (!this.current(connection, row.local_id)) return;
       let count = 0;
       for (const source of this.sources(row.local_id)) {
         if (++count > (this.policy?.limits.maxTaskArtifactCount || 20)) break;
         const { key, job } = this.getJob(connection, source);
         try {
-          const stat = fs.statSync(source.file_path);
+          const stat = await fs.promises.stat(source.file_path);
           job.sizeBytes = String(stat.size);
           const signature = `${source.updated_at}:${source.message_id}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
           if (signature !== job.signature) { job.signature = signature; job.changedAt = Date.now(); job.dirtyAt ||= Date.now(); }
@@ -254,13 +302,17 @@ export class RemoteFileSync {
               && boundary.deviceId === connection.deviceId && boundary.finishedAt === run.finishedAt && boundary.ordinal === ordinal
               && ordinal === this.deps.store.get<string>(`fileRunOrdinal:${row.local_id}:${run.runId}`)
               && stat.mtimeMs <= Date.parse(boundary.finishedAt) + 1 && stat.birthtimeMs <= Date.parse(boundary.finishedAt) + 1;
-            if (admitted) { try { this.capture(connection, source, job, true); } catch { job.reason = RemoteFileReason.Final; } }
+            if (admitted) {
+              try {
+                if (!this.captureProducerVersion(connection, source, job)) { job.reason = RemoteFileReason.Final; await this.capture(connection, source, job); }
+              } catch { job.reason = RemoteFileReason.Final; }
+            }
             else job.reason = RemoteFileReason.Final;
             job.terminalRuns.push(run.runId);
           } else if (run?.runId !== source.run_id && !job.terminalRuns.includes(source.run_id)) {
             job.reason = RemoteFileReason.Final; job.terminalRuns.push(source.run_id);
           } else if (job.dirtyAt && !job.queue.length && run?.runId === source.run_id && !terminal.has(run.status)
-            && (Date.now() - (job.changedAt || 0) >= 2_000 || Date.now() - job.dirtyAt >= 10_000)) this.capture(connection, source, job, false);
+            && (Date.now() - (job.changedAt || 0) >= 2_000 || Date.now() - job.dirtyAt >= 10_000)) await this.capture(connection, source, job);
         } catch (error) { job.reason = error instanceof Error ? error.message : RemoteFileReason.Source; }
         this.save(key, job);
       }
@@ -268,6 +320,7 @@ export class RemoteFileSync {
   }
   private captureTerminal(sessionId: string, runId: string): void {
     const connection = this.connection;
+    this.coldObservationAt.delete(sessionId);
     if (!connection || !this.current(connection, sessionId) || !this.policy?.features.artifactPublish) return;
     const run = this.deps.store.run(sessionId), ordinal = this.deps.store.get<string>(`fileRunOrdinal:${sessionId}:${runId}`);
     if (!ordinal || run?.runId !== runId || !run.finishedAt || !terminal.has(run.status)) return;
@@ -276,18 +329,23 @@ export class RemoteFileSync {
     for (const source of this.sources(sessionId, runId).slice(0, this.policy.limits.maxTaskArtifactCount)) {
       const { key, job } = this.getJob(connection, source);
       if (job.terminalRuns.includes(runId)) continue;
-      try { this.capture(connection, source, job, true); }
-      catch { job.reason = RemoteFileReason.Final; }
-      job.terminalRuns.push(runId); this.save(key, job);
+      try {
+        if (this.captureProducerVersion(connection, source, job)) job.terminalRuns.push(runId);
+        else job.reason = RemoteFileReason.Final; // Mutable sources are captured later as current versions, never as pinned terminal bytes.
+      } catch { job.reason = RemoteFileReason.Final; job.terminalRuns.push(runId); }
+      this.save(key, job);
     }
   }
   private async inputs(connection: Connection): Promise<void> {
-    if (!this.policy) return;
+    if (!this.policy || !this.canUploadInput()) return;
     const jobs = this.deps.store.entries<InputJob>('desktopAsset:');
     for (const { key, value: job } of jobs) {
       if (!sameOwner(job.owner, connection.owner) || !this.current(connection, job.localSessionId)) continue;
       if (job.environment && job.environment !== connection.environment) continue;
-      if (job.availability === 'ready' || (job.retryAt || 0) > Date.now()) continue;
+      if (job.availability === 'ready') continue;
+      this.fileHealth.pending = (this.fileHealth.pending || 0) + 1;
+      if (job.reason) this.fileHealth.degraded = true;
+      if ((job.retryAt || 0) > Date.now()) continue;
       const session = this.deps.store.sync(job.localSessionId);
       if (!session || session.device_id !== connection.deviceId || session.needs_snapshot || session.source_seq !== session.ack_seq) continue;
       try {
@@ -297,21 +355,38 @@ export class RemoteFileSync {
         if (siblings.length > this.policy.limits.maxInputCount || siblings.reduce((sum, item) => sum + BigInt(item.sizeBytes || '0'), 0n) > BigInt(this.policy.limits.maxInputBytes)
           || siblings.filter(item => item.intent === 'image').reduce((sum, item) => sum + BigInt(item.sizeBytes || '0'), 0n) > BigInt(this.policy.limits.maxImageBytes)) throw new Error('INPUT_TOTAL_TOO_LARGE');
         // Only newly captured immutable input sources are eligible. No backfill from mutable historical paths.
-        if (!job.snapshot) throw new Error(RemoteFileReason.Source);
+        if (!job.snapshot) throw new Error(typeof job.captureReason === 'string' && remoteArtifactReasons.has(job.captureReason)
+          ? job.captureReason : RemoteFileReason.Source);
         job.deviceId = connection.deviceId; job.sessionId = session.session_id; job.environment = connection.environment;
         const uploadedAsset = await uploadDesktopMessageAsset({ ...job, path: job.snapshot.path, sha256: job.snapshot.sha256, fileIdentity: undefined }, {
           current: () => this.current(connection, job.localSessionId) && !!this.deps.store.db.prepare("SELECT id FROM cowork_messages WHERE id=? AND session_id=? AND type='user'").get(job.messageId, job.localSessionId),
           request: (pathname, init) => this.deps.request(connection, pathname.replace(/^\/api\/remote\/v1/u, ''), { ...init,
             headers: { ...init.headers, 'X-Remote-File-Policy-Version': this.policy!.policyVersion } }),
-          persist: patch => { this.assert(connection, job.localSessionId); Object.assign(job, patch); this.deps.store.put(key, durableJson(job)); },
+          persist: patch => {
+            this.assert(connection, job.localSessionId);
+            const changed = patch.availability !== undefined && (job.availability !== patch.availability || job.reason !== undefined);
+            Object.assign(job, patch);
+            if (patch.availability !== undefined) job.reason = undefined;
+            this.deps.store.transaction(() => {
+              this.deps.store.put(key, durableJson(job));
+              if (changed) this.deps.store.markFilesDirty(job.localSessionId);
+            });
+          },
         });
         this.assert(connection, job.localSessionId);
         this.deps.store.transaction(() => { this.deps.store.put(key, durableJson({ ...job, availability: 'ready', uploadedAsset, reason: undefined })); this.deps.store.markFilesDirty(job.localSessionId); });
-        fs.rmSync(job.snapshot.path, { force: true });
+        // Remote publication is already committed. A private-cache cleanup failure must not erase its ready receipt.
+        await fs.promises.rm(job.snapshot.path, { force: true }).catch((): void => undefined);
       } catch (error) {
         if (!this.current(connection, job.localSessionId)) return;
-        job.reason = error instanceof Error ? error.message : RemoteFileReason.Transfer; job.retryAt = Date.now() + 60_000;
-        this.deps.store.put(key, durableJson(job));
+        this.fileHealth.degraded = true;
+        const reason = error instanceof Error ? error.message : RemoteFileReason.Transfer;
+        const changed = job.reason !== reason;
+        job.reason = reason; job.retryAt = Date.now() + 60_000;
+        this.deps.store.transaction(() => {
+          this.deps.store.put(key, durableJson(job));
+          if (changed) this.deps.store.markFilesDirty(job.localSessionId);
+        });
       }
     }
   }
@@ -429,22 +504,14 @@ export class RemoteFileSync {
     if (!previous?.pinned && (pending.terminal || pending.artifactVersion || previous)) job.references[pending.messageId] = { runId: pending.runId, latest: job.latest, pinned: pending.terminal };
     job.queue = job.queue.filter(item => item.publicationId !== pending.publicationId);
     job.completedPublications = [...(job.completedPublications || []), pending.publicationId];
-    job.reason = undefined; job.retryAt = undefined; this.save(key, job);
-    fs.rmSync(pending.snapshot.path, { force: true });
+    if (job.reason !== RemoteFileReason.Final) job.reason = undefined;
+    job.retryAt = undefined; this.save(key, job);
+    await fs.promises.rm(pending.snapshot.path, { force: true });
   }
   private projection(sessionId: string, messageId: string): Array<{ localArtifactId: string; block: Record<string, unknown> }> {
     const connection = this.connection;
     if (!connection || !this.current(connection, sessionId)) return [];
-    return this.deps.store.entries<ArtifactJob>(this.prefix(connection)).flatMap(({ value: job }): Array<{ localArtifactId: string; block: Record<string, unknown> }> => {
-      if (job.localSessionId !== sessionId) return [];
-      const reference = job.references[messageId];
-      if (!reference || !job.artifactId) return job.messageId === messageId && job.reason && projectedReasons.has(job.reason)
-        ? [{ localArtifactId: job.localArtifactId, block: { type: 'artifact', artifactId: job.artifactId || job.localArtifactId,
-          name: job.name, mimeType: mime(job.name), sizeBytes: job.sizeBytes || null, availability: 'desktop_only', reason: job.reason } }] : [];
-      return [{ localArtifactId: job.localArtifactId, block: { type: 'artifact', artifactId: job.artifactId, name: reference.pinned ? reference.latest.fileName || job.name : job.name,
-        mimeType: reference.latest.mimeType, sizeBytes: reference.latest.sizeBytes, availability: 'ready',
-        artifactVersion: reference.latest.artifactVersion, assetId: reference.latest.assetId, assetVersion: reference.latest.assetVersion,
-        referenceMode: reference.pinned ? 'pinned' : 'latest' } }];
-    });
+    return projectRemoteArtifacts(this.deps.store.entries<ArtifactJob>(this.prefix(connection))
+      .map(row => row.value).filter(job => job.localSessionId === sessionId), messageId);
   }
 }

@@ -3,7 +3,7 @@ import { constants, createReadStream, promises as fs, realpathSync, statSync } f
 import path from 'path';
 
 import { AgentId } from '../../shared/agent/constants';
-import type { CoworkImageAttachmentPayload } from '../../shared/cowork/imageAttachments';
+import { COWORK_IMAGE_ATTACHMENT_PREVIEW_FALLBACK_MAX_BYTES, type CoworkImageAttachmentPayload, estimateBase64DecodedBytes } from '../../shared/cowork/imageAttachments';
 import { REMOTE_TEXT_BYTES, type RemoteOwner } from '../../shared/remote/constants';
 import { RemoteInputIntent, RemoteInputMode, RemoteInputReason, type RemotePreparationClaim, type RemoteResolvedInput } from '../../shared/remote/input';
 import type { CoworkStore } from '../coworkStore';
@@ -12,7 +12,8 @@ import type { RemoteAgentCatalog } from './remoteAgentCatalog';
 import { RemoteInputError, type RemoteModelCatalog } from './remoteModelCatalog';
 
 interface FileIdentity { realPath: string; dev: string; ino: string; size: number; mtimeMs: number }
-interface LocalAsset { assetId: string; version: string; path: string; identity: FileIdentity; imagePath?: string; imageIdentity?: FileIdentity; imageMime?: string }
+interface InputImagePreview { mimeType: string; base64Data: string }
+interface LocalAsset { preview?: InputImagePreview | null; assetId: string; version: string; path: string; identity: FileIdentity; imagePath?: string; imageIdentity?: FileIdentity; imageMime?: string }
 export interface LocalPreparedInput {
   preparationId: string; owner: RemoteOwner; deviceId: string; requestHash: string; inputDigest: string;
   resolvedInput: RemoteResolvedInput; cwd: string; directoryIdentity: FileIdentity; runtimeRef: string;
@@ -23,8 +24,11 @@ export interface LocalPreparedInput {
 interface Dependencies {
   store: CoworkStore; models: RemoteModelCatalog; cacheRoot: string; getOwner(): RemoteOwner | null;
   getDefaultModel(): string; getAgentCatalog(): RemoteAgentCatalog | null;
+  createImagePreview?(filePath: string): Promise<InputImagePreview | undefined>;
   convertImage?(filePath: string, mimeType: string, targetPath: string): Promise<{ path: string; mimeType: string }>;
 }
+const maxPreviewBytes = 128 * 1024;
+const previewTimeoutMs = 750;
 const imageMimes = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const maxFileBytes = 100 * 1024 * 1024;
 const maxTotalBytes = 256 * 1024 * 1024;
@@ -102,6 +106,24 @@ export class InputPreparationService {
       throw error;
     }
     return folder;
+  }
+  private async imagePreview(filePath: string, check: () => void): Promise<InputImagePreview | undefined> {
+    if (!this.deps.createImagePreview) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let preview: InputImagePreview | undefined;
+    try {
+      preview = await Promise.race([
+        this.deps.createImagePreview(filePath),
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), previewTimeoutMs); }),
+      ]);
+    } catch {
+      console.warn('[RemoteInput] Image preview unavailable; retaining file attachment');
+    } finally { if (timer) clearTimeout(timer); }
+    check(); // A failed preview must not swallow a revoked execution/account permit.
+    if (!preview || !imageMimes.has(preview.mimeType) || !preview.base64Data
+      || preview.base64Data.length > 4 * Math.ceil(maxPreviewBytes / 3)
+      || estimateBase64DecodedBytes(preview.base64Data) > maxPreviewBytes) return undefined;
+    return preview;
   }
   private key(id: string): string { return `inputPreparation:${id}`; }
   private assertOwner(owner: RemoteOwner, current: () => boolean): void {
@@ -209,6 +231,7 @@ export class InputPreparationService {
           }
           if (!imageMimes.has(image.mimeType)) throw new RemoteInputError(RemoteInputReason.Invalid);
           file.imagePath = image.path; file.imageMime = image.mimeType; file.imageIdentity = identity(image.path);
+          file.preview = await this.imagePreview(image.path, check) || null;
           frameBytes += 4 * Math.ceil(file.imageIdentity.size / 3);
           if (frameBytes > imageFrameBytes) throw new RemoteInputError(RemoteInputReason.Invalid);
         }
@@ -276,7 +299,15 @@ export class InputPreparationService {
         if (!sameFile(file.imagePath!, file.imageIdentity!)) throw new RemoteInputError(RemoteInputReason.Stale);
         const data = await fs.readFile(file.imagePath!); check();
         if (!sameFile(file.imagePath!, file.imageIdentity!)) throw new RemoteInputError(RemoteInputReason.Stale);
-        imageAttachments.push({ name: asset.fileName, mimeType: file.imageMime!, base64Data: data.toString('base64'), sizeBytes: data.length, localPath: file.path });
+        // Preparations saved before preview support can still produce a desktop thumbnail.
+        const preview = file.preview === undefined ? await this.imagePreview(file.imagePath!, check) : file.preview;
+        check();
+        if (!sameFile(file.imagePath!, file.imageIdentity!)) throw new RemoteInputError(RemoteInputReason.Stale);
+        imageAttachments.push({ name: asset.fileName, mimeType: file.imageMime!, base64Data: data.toString('base64'), sizeBytes: data.length, localPath: file.path,
+          ...(preview ? { previewBase64Data: preview.base64Data, previewMimeType: preview.mimeType } : {}) });
+        // Large images without a thumbnail are omitted by the shared preview builder.
+        // Keep a visible filename while sending the original image to the model.
+        if (!preview && data.length > COWORK_IMAGE_ATTACHMENT_PREVIEW_FALLBACK_MAX_BYTES) references.push(`[File: ${JSON.stringify(asset.fileName)}]`);
       } else references.push(`[File: ${JSON.stringify(asset.fileName)}] ${JSON.stringify(file.path)}`);
     }
     return { prompt: [prepared.resolvedInput.text, ...references].filter(Boolean).join('\n\n') || ' ', modelOverride: prepared.runtimeRef,

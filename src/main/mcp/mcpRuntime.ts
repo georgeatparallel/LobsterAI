@@ -7,10 +7,12 @@ import { McpIpcChannel } from '../../shared/mcp/constants';
 import { isComputerUseKitInstalled } from '../computerUse/computerUseKit';
 import { resolveComputerUseMcpServer } from '../computerUse/computerUseMcpServer';
 import { installComputerUseRuntime } from '../computerUse/computerUseRuntime';
+import type { CoworkRuntime } from '../libs/agentEngine/types';
 import { getElectronNodeRuntimePath } from '../libs/coworkUtil';
 import {
   type AskUserRequest,
   type AskUserResponse,
+  AskUserResponseReason,
   type BrowserToolRequest,
   type BrowserToolResponse,
   McpBridgeServer,
@@ -28,6 +30,20 @@ import { McpStore } from './mcpStore';
 
 export type { AskUserResponse, MediaGenerationRequest, MediaGenerationResponse };
 
+function questionStatus(response: AskUserResponse): 'answered' | 'cancelled' | 'expired' | 'unavailable' {
+  if (response.reason === AskUserResponseReason.Timeout) return 'expired';
+  if (response.reason === AskUserResponseReason.Unavailable) return 'unavailable';
+  return response.behavior === 'allow' ? 'answered' : 'cancelled';
+}
+
+function questionAnswers(request: AskUserRequest, response: AskUserResponse): Record<string, string[]> {
+  return Object.fromEntries(request.questions.map((question, index) => {
+    const value = response.answers?.[question.question];
+    return [`q_${index}`, typeof value !== 'string' || !value ? []
+      : question.multiSelect ? value.split('|||').map(item => item.trim()).filter(Boolean) : [value]];
+  }));
+}
+
 export interface McpRuntimeDeps {
   /** Shared with the IPC ownership check; only live question IDs are registered here. */
   permissionSessions: Map<string, string>;
@@ -41,6 +57,8 @@ export interface McpRuntimeDeps {
   onAskUserRequested?: (sessionId: string, request: { requestId: string; toolName: string }) => void;
   /** Fired when a pending AskUserQuestion request is dismissed upstream. */
   onAskUserDismissed?: (requestId: string) => void;
+  registerQuestion?: NonNullable<CoworkRuntime['registerQuestion']>;
+  settleQuestion?: NonNullable<CoworkRuntime['settleQuestion']>;
 }
 
 export class McpRuntime {
@@ -48,6 +66,7 @@ export class McpRuntime {
   private launchResolverManager: McpLaunchResolverManager | null = null;
   private bridgeServer: McpBridgeServer | null = null;
   private readonly bridgeSecret = crypto.randomUUID();
+  private readonly remoteQuestions = new Map<string, { request: AskUserRequest; terminal?: AskUserResponse }>();
   private resolvedServersCache: ResolvedMcpServer[] = [];
   private mediaGenerationHandler:
     | ((request: MediaGenerationRequest) => Promise<MediaGenerationResponse>)
@@ -152,6 +171,7 @@ export class McpRuntime {
         return;
       }
       this.deps.permissionSessions.set(request.requestId, sessionId);
+      this.registerQuestion(sessionId, request);
       const windows = BrowserWindow.getAllWindows();
       windows.forEach(win => {
         if (win.isDestroyed()) return;
@@ -174,6 +194,17 @@ export class McpRuntime {
       this.deps.onAskUserRequested?.(sessionId, {
         requestId: request.requestId,
         toolName: ASK_USER_QUESTION_TOOL_NAME,
+      });
+    });
+
+    this.bridgeServer.onAskUserSettled((requestId, response) => {
+      const pending = this.remoteQuestions.get(requestId);
+      if (!pending) return;
+      pending.terminal = response;
+      this.remoteQuestions.delete(requestId);
+      this.deps.settleQuestion?.(requestId, {
+        status: questionStatus(response),
+        ...(response.behavior === 'allow' ? { answers: questionAnswers(pending.request, response) } : {}),
       });
     });
 
@@ -203,6 +234,50 @@ export class McpRuntime {
 
     if (this.browserToolHandler) {
       this.bridgeServer.onBrowserTool(this.browserToolHandler);
+    }
+  }
+
+  /** Only a verified desktop session may publish a legacy form to remote control. */
+  private registerQuestion(sessionId: string, request: AskUserRequest): void {
+    if (!this.deps.registerQuestion || !request.sessionKey || sessionId === SESSION_AGNOSTIC_PERMISSION_SESSION_ID) return;
+    try {
+      // Do not discard a secret marker while adapting the ordinary form contract.
+      if (request.questions.some(question => {
+        const raw = question as unknown as Record<string, unknown>;
+        return raw.isSecret === true || raw.secretStore !== undefined;
+      })) return;
+      // Legacy answers use the question text as their key; duplicate keys cannot round-trip.
+      if (new Set(request.questions.map(question => question.question)).size !== request.questions.length) return;
+      const snapshot: AskUserRequest = { ...request, questions: request.questions.map(question => ({
+        ...question, options: question.options.map(option => ({ ...option })),
+      })) };
+      const pending: { request: AskUserRequest; terminal?: AskUserResponse } = { request: snapshot };
+      this.remoteQuestions.set(request.requestId, pending);
+      const registered = this.deps.registerQuestion({
+        requestId: request.requestId, sessionId, kind: 'legacy',
+        createdAt: request.createdAt, expiresAt: request.expiresAt,
+        questions: snapshot.questions.map((question, index) => ({
+          questionId: `q_${index}`, header: question.header ?? '', question: question.question,
+          options: question.options, multiSelect: question.multiSelect === true, isOther: true, allowSkip: true,
+        })),
+        resolve: response => {
+          const answers: Record<string, string> = Object.create(null);
+          if (response.action === 'answer') snapshot.questions.forEach((question, index) => {
+            const values = response.answers[`q_${index}`] ?? [];
+            if (values.length) answers[question.question] = question.multiSelect ? values.join('|||') : values[0];
+          });
+          const applied = this.resolveAskUser(request.requestId, response.action === 'answer'
+            ? { behavior: 'allow', answers } : { behavior: 'deny' });
+          if (!applied || !pending.terminal) return { kind: 'known_not_applied', reason: 'QUESTION_UNAVAILABLE' };
+          if (pending.terminal.reason) return { kind: 'known_not_applied', status: questionStatus(pending.terminal), reason: 'QUESTION_UNAVAILABLE' };
+          return { kind: 'confirmed', status: questionStatus(pending.terminal),
+            ...(pending.terminal.behavior === 'allow' ? { answers: questionAnswers(snapshot, pending.terminal) } : {}) };
+        },
+      });
+      if (!registered) this.remoteQuestions.delete(request.requestId);
+    } catch (error) {
+      this.remoteQuestions.delete(request.requestId);
+      console.warn('[AskUser] remote question registration unavailable; local form remains usable', error instanceof Error ? error.name : 'Error');
     }
   }
 

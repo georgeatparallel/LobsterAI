@@ -5,6 +5,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, expect, it, vi } from 'vitest';
 
+import { RemoteQuestion } from '../../shared/remote/questions';
 import type { CoworkStore } from '../coworkStore';
 import { ApprovalDecisionService } from '../libs/agentEngine/approvalDecisionService';
 import type { CoworkRuntime } from '../libs/agentEngine/types';
@@ -78,6 +79,8 @@ function fixture(agentId = 'main', explicit = false, workingPath = '/work') {
     },
   };
   const runtime = Object.assign(new EventEmitter(), { stopSession: vi.fn(), cancelSessionConfirmed: vi.fn(async () => true), respondToPermissionConfirmed: vi.fn(async (..._args: any[]) => ({ kind: 'confirmed' as const, decision: 'approve' as const })),
+    getQuestionState: vi.fn((_id: string): any => null), respondToQuestionConfirmed: vi.fn(async (..._args: any[]): Promise<any> => ({ kind: 'confirmed', status: 'answered' })),
+    reconcileQuestionSubmission: vi.fn(async (..._args: any[]): Promise<any> => null),
     getPermissionState: vi.fn((_requestId: string): any => null), expirePermissions: vi.fn(), closeSessionPermissions: vi.fn(),
     reconcileApprovalSubmission: vi.fn(async (..._args: any[]): Promise<any> => null), getApprovalSubmission: vi.fn((): any => null) });
   const service = new SessionCommandService(store as unknown as CoworkStore, runtime as unknown as CoworkRuntime, () => owner);
@@ -415,4 +418,47 @@ it('gives anonymous tasks distinct local runs and never lets an old approval con
   expect(f.first.remote.run('local')).toEqual(next);
   expect(f.first.continuation).not.toHaveBeenCalled();
   expect(f.first.remote.pending('local')).toEqual([]); expect(f.first.remote.sessions(owner)).toEqual([]);
+});
+
+
+function questionCommand(value: ReturnType<typeof fixture>): typeof value.entry {
+  const request = { type: RemoteQuestion.Command, sessionId: 'server-session', payload: { questionId: 'question', questionVersion: '1',
+    operationDigest: 'digest', runId: 'server-run', action: 'answer', answers: { q_0: ['Yes'] } } };
+  return { ...value.entry, command: { ...value.entry.command, type: RemoteQuestion.Command, request, requestHash: payloadHash(request), claimId: 'claim', claimToken: 'token' } };
+}
+it('dispatches question answers through the authority with original version and live permit checks', async () => {
+  const f = fixture(), entry = questionCommand(f);
+  f.runtime.getQuestionState.mockReturnValue({ sessionId: 'local', runId: 'server-run' });
+  let permitted = true;
+  f.runtime.respondToQuestionConfirmed.mockImplementation(async (id, result, options) => {
+    expect(id).toBe('question'); expect(result).toEqual({ behavior: 'allow', updatedInput: { answers: { q_0: ['Yes'] } } });
+    expect(options).toMatchObject({ submissionId: 'cmd', source: 'mobile', expectedVersion: '1', operationDigest: 'digest' });
+    permitted = false;
+    expect(() => options.beforeDispatch()).toThrow('permit expired');
+    return { kind: 'known_not_applied', reason: 'QUESTION_NOT_DISPATCHED' };
+  });
+  await expect(f.service.execute(entry, () => permitted)).rejects.toMatchObject({ outcome: { kind: 'known_not_applied' } });
+  expect(f.runtime.respondToPermissionConfirmed).not.toHaveBeenCalled();
+  expect(entry.command.request.payload.questionVersion).toBe('1');
+});
+it('accepts only an exact confirmed question result and refuses an old run', async () => {
+  const f = fixture(), entry = questionCommand(f);
+  f.runtime.getQuestionState.mockReturnValue({ sessionId: 'local', runId: 'server-run' });
+  await expect(f.service.execute(entry, () => true)).resolves.toEqual({ outcome: 'question_applied' });
+  f.runtime.respondToQuestionConfirmed.mockResolvedValue({ kind: 'unknown', reason: 'QUESTION_RESULT_UNKNOWN' });
+  await expect(f.service.execute(entry, () => true)).rejects.toMatchObject({ outcome: { kind: 'unknown' } });
+  f.runtime.respondToQuestionConfirmed.mockClear();
+  f.runtime.getQuestionState.mockReturnValue({ sessionId: 'local', runId: 'different-run' });
+  await expect(f.service.execute(entry, () => true)).rejects.toMatchObject({ outcome: { kind: 'known_not_applied' } });
+  expect(f.runtime.respondToQuestionConfirmed).not.toHaveBeenCalled();
+});
+it('reconciles question receipts without issuing answers and only proves exact prepared claims unstarted', async () => {
+  const f = fixture(), entry = questionCommand(f);
+  const prepared = { ...entry, state: 'prepared' as const };
+  f.remote.put('inbox:cmd', prepared);
+  await expect(f.service.reconcileQuestion(prepared)).resolves.toMatchObject({ kind: 'known_not_applied', reason: 'NEVER_DISPATCHED' });
+  await expect(f.service.reconcileQuestion({ ...prepared, command: { ...prepared.command, claimToken: 'wrong' } })).resolves.toBeNull();
+  f.remote.put('inbox:cmd', entry);
+  await expect(f.service.reconcileQuestion(entry)).resolves.toBeNull();
+  expect(f.runtime.respondToQuestionConfirmed).not.toHaveBeenCalled();
 });

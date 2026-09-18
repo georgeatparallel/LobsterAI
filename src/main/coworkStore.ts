@@ -65,6 +65,7 @@ import {
 } from './libs/sessionProjectionNotifications';
 import { ownershipOperationGate } from './ownershipOperationGate';
 import { sameOwner } from './remote/canonical';
+import { recordRemoteSessionDeletion } from './remote/remoteLocalGc';
 import { RemoteStore } from './remote/remoteStore';
 
 
@@ -807,7 +808,7 @@ export class CoworkStore {
 
   constructor(db: Database.Database) {
     this.db = db;
-    this.remote = new RemoteStore(db);
+    this.remote = new RemoteStore(db, { deferredProjection: true });
     this.agentOwnership = new AgentOwnerStore(db);
     this.sessionProjectionNotifications = new SessionProjectionNotifications({
       runTransaction: operation => this.remote.transaction(operation),
@@ -1589,6 +1590,7 @@ export class CoworkStore {
   private deleteSessionRows(ids: string[]): string[] {
     if (ids.length === 0) return [];
     this.sessionProjectionNotifications.capture(ids);
+    for (const id of ids) recordRemoteSessionDeletion(this.remote, id);
     const placeholders = ids.map(() => '?').join(',');
     const affectedArtifactRows = this.getAll<{ artifact_id: string }>(
       `SELECT DISTINCT artifact_id

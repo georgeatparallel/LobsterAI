@@ -25,6 +25,9 @@ const log = (level: string, msg: string) => {
 
 export type AskUserRequest = {
   requestId: string;
+  /** Trusted bridge timestamps; never accepted from the callback body. */
+  createdAt: number;
+  expiresAt: number;
   sessionKey?: string;
   questions: Array<{
     question: string;
@@ -49,6 +52,7 @@ export type AskUserResponse = {
 
 type PendingAskUser = {
   requestId: string;
+  expiresAt: number;
   resolve: (response: AskUserResponse) => void;
   timer: ReturnType<typeof setTimeout>;
 };
@@ -86,6 +90,7 @@ export class McpBridgeServer {
   private readonly pendingAskUser = new Map<string, PendingAskUser>();
   private onAskUserCallback: ((request: AskUserRequest) => void) | null = null;
   private onAskUserDismissCallback: ((requestId: string) => void) | null = null;
+  private onAskUserSettledCallback: ((requestId: string, response: AskUserResponse) => void) | null = null;
   private onMediaGenerationCallback: ((request: MediaGenerationRequest) => Promise<MediaGenerationResponse>) | null = null;
   private onBrowserToolCallback: ((request: BrowserToolRequest) => Promise<BrowserToolResponse>) | null = null;
 
@@ -126,6 +131,11 @@ export class McpBridgeServer {
     this.onAskUserDismissCallback = callback;
   }
 
+  /** Receive the actual terminal result, including timeout and shutdown. */
+  onAskUserSettled(callback: (requestId: string, response: AskUserResponse) => void): void {
+    this.onAskUserSettledCallback = callback;
+  }
+
   /**
    * Register a callback for media generation tool requests.
    * The callback should call lobsterai-server and return the result.
@@ -146,8 +156,14 @@ export class McpBridgeServer {
     if (!pending) return false;
     clearTimeout(pending.timer);
     this.pendingAskUser.delete(requestId);
-    pending.resolve(response);
-    this.onAskUserDismissCallback?.(requestId);
+    const terminal = Date.now() >= pending.expiresAt
+      ? { behavior: 'deny' as const, reason: AskUserResponseReason.Timeout } : response;
+    pending.resolve(terminal);
+    // A derived authority/projection failure must never strand the local question.
+    try { this.onAskUserSettledCallback?.(requestId, terminal); }
+    catch (error) { log('WARN', `AskUser settlement observer failed: ${error instanceof Error ? error.name : 'Error'}`); }
+    try { this.onAskUserDismissCallback?.(requestId); }
+    catch (error) { log('WARN', `AskUser dismissal observer failed: ${error instanceof Error ? error.name : 'Error'}`); }
     return true;
   }
 
@@ -163,6 +179,8 @@ export class McpBridgeServer {
   ): Promise<AskUserResponse> {
     const requestId = crypto.randomUUID();
     const sessionKey = options.sessionKey?.trim() || undefined;
+    const createdAt = Date.now();
+    const expiresAt = createdAt + timeoutMs;
     log('INFO', `AskUser (internal) request, requestId=${requestId}`);
 
     return new Promise<AskUserResponse>((resolve) => {
@@ -171,10 +189,10 @@ export class McpBridgeServer {
         this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Timeout });
       }, timeoutMs);
 
-      this.pendingAskUser.set(requestId, { requestId, resolve, timer });
+      this.pendingAskUser.set(requestId, { requestId, expiresAt, resolve, timer });
 
       if (this.onAskUserCallback) {
-        this.onAskUserCallback({ requestId, questions, sessionKey });
+        this.onAskUserCallback({ requestId, questions, sessionKey, createdAt, expiresAt });
       } else {
         log('WARN', 'AskUser callback not registered, denying (internal)');
         this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Unavailable });
@@ -221,6 +239,9 @@ export class McpBridgeServer {
    * Stop the HTTP callback server.
    */
   async stop(): Promise<void> {
+    for (const requestId of this.pendingAskUser.keys()) {
+      this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Unavailable });
+    }
     if (!this.server) return;
 
     return new Promise((resolve) => {
@@ -292,6 +313,8 @@ export class McpBridgeServer {
       }
 
       const requestId = crypto.randomUUID();
+      const createdAt = Date.now();
+      const expiresAt = createdAt + ASKUSER_TIMEOUT_MS;
       log('INFO', `AskUser waiting for user response, requestId=${requestId}`);
 
       // Create a Promise that resolves when the user responds or timeout
@@ -301,7 +324,7 @@ export class McpBridgeServer {
           this.resolveAskUser(requestId, { behavior: 'deny', reason: AskUserResponseReason.Timeout });
         }, ASKUSER_TIMEOUT_MS);
 
-        this.pendingAskUser.set(requestId, { requestId, resolve, timer });
+        this.pendingAskUser.set(requestId, { requestId, expiresAt, resolve, timer });
 
         // Notify LobsterAI to show the modal
         if (this.onAskUserCallback) {
@@ -309,6 +332,8 @@ export class McpBridgeServer {
             requestId,
             sessionKey,
             questions: input.questions as AskUserRequest['questions'],
+            createdAt,
+            expiresAt,
           });
         } else {
           log('WARN', 'AskUser callback not registered, denying');

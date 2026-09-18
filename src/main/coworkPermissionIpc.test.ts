@@ -115,3 +115,12 @@ test('native question completion checks that the account has not changed', async
     result: { behavior: 'deny' },
   }, deps)).rejects.toThrow('APPROVAL_ACCESS_DENIED');
 });
+
+test('registered ordinary questions use the shared confirmed lane without legacy fallback', async () => {
+  const { deps } = fixture(); deps.runtime.getPermissionState = () => null;
+  deps.runtime.getQuestionState = () => ({ sessionId: 'session-1' }) as never;
+  const response = vi.fn(async () => ({ kind: 'unknown' as const, reason: 'QUESTION_RESULT_UNKNOWN' }));
+  deps.runtime.respondToQuestionConfirmed = response;
+  expect(await submitCoworkPermission({ requestId: 'question-1', result: { behavior: 'allow', updatedInput: { answers: { choice: ['A'] } } } }, deps)).toMatchObject({ kind: 'unknown' });
+  expect(response).toHaveBeenCalledTimes(1); expect(deps.resolveQuestion).not.toHaveBeenCalled();
+});

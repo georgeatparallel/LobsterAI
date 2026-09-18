@@ -90,9 +90,12 @@ import { OpenClawGatewayFailureKind } from '../../../shared/openclawEngine/const
 import { OpenClawTranscriptSafetyStatus } from '../../../shared/openclawTranscript/constants';
 import { ProviderName } from '../../../shared/providers';
 import type { RemoteOwner } from '../../../shared/remote/constants';
+import { RemoteInputOperationPhase } from '../../../shared/remote/input';
+import type { LocalQuestionState, QuestionAnswers, QuestionDecisionOptions, QuestionDecisionOutcome, QuestionStatus } from '../../../shared/remote/questions';
 import type { Agent, CoworkExecutionMode, CoworkMessage, CoworkMessageMetadata, CoworkSession, CoworkSessionStatus, CoworkStore } from '../../coworkStore';
 import { t } from '../../i18n';
 import { MediaGenerationTool } from '../../mediaGenerationPolicy';
+import { type QuestionRegistration, RemoteQuestionError, RemoteQuestionService } from '../../remote/remoteQuestionService';
 import type { SubagentMessageStore } from '../../subagentMessageStore';
 import type { SubagentRunStore } from '../../subagentRunStore';
 import { setCoworkProxySessionId } from '../coworkOpenAICompatProxy';
@@ -2616,6 +2619,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   private readonly subagentTracker: SubagentTracker;
   private readonly subagentSessionMaterializer: SubagentSessionMaterializer;
   private readonly approvalController: OpenClawApprovalController;
+  private readonly questionDecisions: RemoteQuestionService;
   private readonly questionController: OpenClawQuestionController;
   private readonly thinkingController: OpenClawThinkingController;
   private readonly turnHistorySync: OpenClawTurnHistorySync;
@@ -3145,7 +3149,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           throw new Error('Session configuration writer changed before dispatch');
         }
         // Record the actual selected client/writer after all readiness and model-queue awaits.
-        this.store.remote.put(`inputFence:${sessionId}`, { ...fence,
+        this.store.remote.put(`inputFence:${sessionId}`, { ...fence, phase: RemoteInputOperationPhase.Dispatched,
           gatewayBootId: this.getRecoveryGatewayBootId(), gatewayProcessPid: this.getRecoveryGatewayProcessPid() ?? null });
       }
       response = await client.request<OpenClawSessionPatchGatewayResult>('sessions.patch', {
@@ -3741,7 +3745,23 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         this.handleIncrementalBackfillHistory(sessionId, messages);
       },
     });
+    this.questionDecisions = new RemoteQuestionService(this.store.remote, (sessionId) => {
+      const session = this.store.getSession(sessionId, 0), run = this.store.remote.run(sessionId);
+      if (!session || !run) return null;
+      return { runId: run.runId, owner: this.store.remote.owner(sessionId), agentId: session.agentId ?? 'main', cwd: session.cwd };
+    });
     this.questionController = new OpenClawQuestionController({
+      onQuestion: (sessionId, record) => this.registerQuestion({
+        requestId: `${OpenClawQuestion.RequestIdPrefix}${record.id}`, sessionId, kind: 'native',
+        createdAt: Date.now(), expiresAt: record.expiresAtMs,
+        questions: record.questions.map(question => ({ ...question, multiSelect: question.multiSelect === true,
+          isOther: question.isOther === true || !question.options.length, allowSkip: false })),
+        resolve: response => this.questionController.resolveConfirmed(record, response),
+        reconcile: () => this.questionController.reconcileConfirmed(record),
+      }),
+      onSettled: (id, result) => this.settleQuestion(id, result),
+      onUnavailable: id => this.questionDecisions.suspend(id),
+      onExpired: id => this.questionDecisions.expire(id),
       getGatewayClient: () => this.gatewayClient,
       resolveSessionId: (sessionKey, runId) => {
         // Leave channel questions to their native delivery UI; never fall back to the active task.
@@ -5294,8 +5314,8 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   reconcileApprovalSubmission(id: string, options?: ApprovalReconcileOptions): Promise<ApprovalDecisionOutcome | null> { return this.approvalController.reconcileApprovalSubmission(id, options); }
   configureDualApproval(configuration: DualApprovalConfiguration): void { this.approvalController.configureDualApproval(configuration); }
   supportsDualApproval(): boolean { return this.approvalController.supportsDualApproval(); }
-  expirePermissions(now?: number): void { this.approvalController.expirePermissions(now); }
-  closeSessionPermissions(id: string, runId: string | null, status?: 'cancelled' | 'expired' | 'superseded'): void { this.approvalController.closeSessionPermissions(id, runId, status); }
+  expirePermissions(now?: number): void { this.approvalController.expirePermissions(now); this.questionDecisions.expirePending(now); }
+  closeSessionPermissions(id: string, runId: string | null, status?: 'cancelled' | 'expired' | 'superseded'): void { this.approvalController.closeSessionPermissions(id, runId, status); this.questionDecisions.closeSession(id, runId); }
   listPendingPermissions(): Array<{ sessionId: string; request: PermissionRequest }> { return this.approvalController.listPendingPermissions(); }
 
   stopSession(sessionId: string): void {
@@ -5363,11 +5383,22 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   }
 
   respondToPermission(requestId: string, result: PermissionResult): void | Promise<void> {
+    if (this.questionDecisions.getState(requestId)) return this.questionDecisions.submit(requestId, result).then(outcome => {
+      if (outcome.kind !== 'confirmed') throw new RemoteQuestionError(outcome);
+    });
     if (this.questionController.handlesRequest(requestId)) {
       return this.questionController.respond(requestId, result);
     }
     this.approvalController.respondToPermission(requestId, result);
   }
+
+  registerQuestion(input: QuestionRegistration): LocalQuestionState | null { return this.questionDecisions.register(input); }
+  settleQuestion(id: string, result: { status: Exclude<QuestionStatus, 'pending'>; answers?: QuestionAnswers }): void { this.questionDecisions.settle(id, result); }
+  getQuestionState(id: string): LocalQuestionState | null { return this.questionDecisions.getState(id); }
+  respondToQuestionConfirmed(id: string, result: PermissionResult, options?: QuestionDecisionOptions): Promise<QuestionDecisionOutcome> {
+    return this.questionDecisions.submit(id, result, options);
+  }
+  reconcileQuestionSubmission(id: string): Promise<QuestionDecisionOutcome | null> { return this.questionDecisions.reconcile(id); }
 
   getPendingQuestions() {
     return this.questionController.getPendingQuestions();
