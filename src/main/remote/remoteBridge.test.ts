@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnershipSyncState, OwnershipTargetKind } from '../../shared/ownership/constants';
-import { RemoteCapability, RemoteSyncStatus } from '../../shared/remote/constants';
+import { RemoteCapability, RemoteSyncHealthReason, RemoteSyncHealthStatus, RemoteSyncStatus } from '../../shared/remote/constants';
 import { RemoteQuestion } from '../../shared/remote/questions';
 import { RemoteReply } from '../../shared/remote/reply';
 import { OwnershipAssociationStore } from '../ownershipAssociationStore';
@@ -66,6 +66,54 @@ function fixture() {
   return { store, bridge, envelope, calls, execute, requestApi, disconnect: () => { disconnectOnReceipt = true; }, terminalReceipt: () => { receiptStatus = 'applied'; } };
 }
 afterEach(() => { for (const db of databases.splice(0)) db.close(); });
+
+describe('device synchronization health', () => {
+  it('keeps an online idle device idle during and after an empty history scan', async () => {
+    const { bridge, store, requestApi } = fixture();
+    bridge.stopped = false; bridge.lastPong = Date.now();
+    let release!: () => void;
+    const scan = vi.spyOn(store, 'flushProjections').mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    try {
+      expect(bridge.state()).toMatchObject({ connected: true, syncHealth: { status: RemoteSyncHealthStatus.Idle, pendingSessions: 0 } });
+      bridge.startHistorySync();
+      const work = bridge.historyWork;
+      expect(work).toBeInstanceOf(Promise);
+      expect(bridge.state()).toMatchObject({ connected: true, syncHealth: { status: RemoteSyncHealthStatus.Idle, pendingSessions: 0 } });
+      release(); await work;
+      expect(bridge.state().syncHealth.status).toBe(RemoteSyncHealthStatus.Idle);
+      expect(requestApi).not.toHaveBeenCalled();
+    } finally {
+      release?.(); await bridge.historyWork; scan.mockRestore(); bridge.stop();
+    }
+  });
+  it('reports real pending content until its ACK even with no history scan in progress', () => {
+    const { bridge, store } = fixture(); store.setEnabledOwner(owner); bridge.lastPong = Date.now();
+    try {
+      store.transaction(() => {
+        store.db.exec("INSERT INTO cowork_sessions VALUES('pending-task','Task',1,1,'idle')");
+        store.assignNew('pending-task', owner, 'local_create');
+      });
+      expect(bridge.historyWork).toBeNull();
+      expect(bridge.state()).toMatchObject({ connected: true, syncHealth: { status: RemoteSyncHealthStatus.Syncing, pendingSessions: 1 } });
+      const snapshot = store.snapshot('pending-task');
+      const row = store.sync('pending-task')!;
+      store.bindRemote('pending-task', row.session_id, 'desktop');
+      store.acknowledge('pending-task', 'desktop', row.session_id, snapshot.baseSourceSeq, '1', true, snapshot.snapshotEpoch);
+      expect(bridge.state().syncHealth).toMatchObject({ status: RemoteSyncHealthStatus.Idle, pendingSessions: 0 });
+    } finally { bridge.stop(); }
+  });
+  it('continues to surface pending files and failures independently of the history scheduler', () => {
+    const { bridge } = fixture(); bridge.lastPong = Date.now();
+    try {
+      bridge.files = { health: () => ({ pending: 1, degraded: false }), pause: (): void => undefined };
+      expect(bridge.state().syncHealth.status).toBe(RemoteSyncHealthStatus.Syncing);
+      bridge.files = { health: () => ({ pending: 1, degraded: true }), pause: (): void => undefined };
+      expect(bridge.state().syncHealth).toMatchObject({ status: RemoteSyncHealthStatus.Degraded, reason: RemoteSyncHealthReason.Files });
+      bridge.sessionSyncFailed = true;
+      expect(bridge.state().syncHealth).toMatchObject({ status: RemoteSyncHealthStatus.Degraded, reason: RemoteSyncHealthReason.Projection });
+    } finally { bridge.stop(); }
+  });
+});
 
 describe('ownership association synchronization', () => {
   function claimed() {

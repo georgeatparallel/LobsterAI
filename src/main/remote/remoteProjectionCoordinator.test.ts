@@ -6,6 +6,7 @@ import os from 'os';
 import path from 'path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
+import { initializeLibraryTables } from '../library/libraryMigrations';
 import { RemoteStore } from './remoteStore';
 
 const workerDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-projection-test-worker-'));
@@ -19,18 +20,28 @@ afterAll(() => fs.rmSync(workerDirectory, { recursive: true, force: true }));
 const owner = { userId: 'A', scopeKey: 'personal' };
 const dispose: Array<() => void> = [];
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); });
-function fixture(disk = true) {
+function fixture(disk = true, withArtifacts = false) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-isolation-'));
   dispose.push(() => fs.rmSync(directory, { recursive: true, force: true }));
   const db = new Database(disk ? path.join(directory, 'core.sqlite') : ':memory:'); dispose.push(() => db.close());
   db.exec(`CREATE TABLE cowork_sessions(id TEXT PRIMARY KEY,title TEXT,created_at INTEGER,updated_at INTEGER,status TEXT);
     CREATE TABLE cowork_messages(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,content TEXT,metadata TEXT,created_at INTEGER,sequence INTEGER);`);
+  if (withArtifacts) initializeLibraryTables(db);
   const store = new RemoteStore(db, { deferredProjection: true, projectionWorkerPath: workerPath }); store.setEnabledOwner(owner);
   store.transaction(() => {
     db.exec("INSERT INTO cowork_sessions VALUES('task','Task',1,1,'idle')"); store.assignNew('task', owner, 'local_create');
     db.exec("INSERT INTO cowork_messages VALUES('message','task','assistant','Original','{}',1,1)");
   });
   return { store, db, directory };
+}
+
+function addArtifact(db: Database.Database, id: string, sessionId: string, messageId: string): void {
+  db.prepare(`INSERT INTO library_local_artifacts
+    (id,path_key,file_path,file_name,extension,artifact_type,category,size_bytes,sort_time_ms,first_seen_at,last_seen_at,last_verified_at,created_at,updated_at)
+    VALUES (?,?,?,?,?,'markdown','text',12,1,1,1,1,1,1)`).run(id, `/private/${id}.md`, `/private/${id}.md`, `${id}.md`, 'md');
+  db.prepare(`INSERT INTO library_artifact_sessions
+    (artifact_id,session_id,relation_kind,first_related_at,last_related_at,last_message_id,created_at,updated_at)
+    VALUES (?,?,'created',1,1,?,1,1)`).run(id, sessionId, messageId);
 }
 
 describe('desktop core and remote projection isolation', () => {
@@ -77,6 +88,49 @@ describe('desktop core and remote projection isolation', () => {
     expect(f.store.sync('task')?.source_seq).toBe(0); expect(f.db.prepare('SELECT * FROM remote_dirty').all()).toHaveLength(1);
     f.store.setEnabledOwner(owner); await f.store.flushProjections();
     expect(f.store.snapshot('task').records.find(row => row.payload.message)?.payload.message.blocks[0].text).toBe('Offline');
+  });
+  it('projects real library foreign keys in a disk worker without copying unrelated task artifacts', async () => {
+    const f = fixture(true, true);
+    expect(f.db.pragma('foreign_keys', { simple: true })).toBe(1);
+    expect(f.db.pragma('foreign_key_list(library_artifact_sessions)')).toEqual(expect.arrayContaining([
+      expect.objectContaining({ table: 'library_local_artifacts' }), expect.objectContaining({ table: 'cowork_sessions' }),
+    ]));
+    f.store.transaction(() => {
+      addArtifact(f.db, 'report', 'task', 'message');
+      f.db.exec("INSERT INTO cowork_sessions VALUES('other','Other',1,1,'idle')");
+      f.store.assignNew('other', { userId: 'B', scopeKey: 'personal' }, 'local_create');
+      addArtifact(f.db, 'other-private', 'other', 'other-message');
+    });
+    const artifacts = f.db.prepare('SELECT * FROM library_local_artifacts ORDER BY id').all();
+    const relations = f.db.prepare('SELECT * FROM library_artifact_sessions ORDER BY artifact_id').all();
+    await f.store.flushProjections();
+    expect(f.db.prepare('SELECT * FROM remote_projection_failures').all()).toEqual([]);
+    const message = f.store.snapshot('task').records.find(row => row.payload.message)?.payload.message;
+    expect(message?.blocks).toContainEqual(expect.objectContaining({ type: 'artifact', artifactId: 'report', name: 'report.md' }));
+    expect(JSON.stringify(message)).not.toContain('other-private');
+    expect(JSON.stringify(message)).not.toContain('/private/');
+    expect(f.db.prepare('SELECT * FROM library_local_artifacts ORDER BY id').all()).toEqual(artifacts);
+    expect(f.db.prepare('SELECT * FROM library_artifact_sessions ORDER BY artifact_id').all()).toEqual(relations);
+    expect(f.db.pragma('foreign_key_check')).toEqual([]);
+  });
+  it('automatically clears an expired projection failure after rebuilding with the real library schema', async () => {
+    const f = fixture(true, true);
+    f.store.transaction(() => addArtifact(f.db, 'report', 'task', 'message'));
+    f.store.recordProjectionFailure('task', 'no such table: main.library_local_artifacts');
+    f.db.prepare('UPDATE remote_projection_failures SET retry_at=0 WHERE session_id=?').run('task');
+    expect(f.db.prepare('SELECT content FROM cowork_messages WHERE id=?').get('message')).toEqual({ content: 'Original' });
+    await f.store.flushProjections();
+    expect(f.db.prepare('SELECT * FROM remote_projection_failures').all()).toEqual([]);
+    expect(f.db.prepare('SELECT * FROM remote_dirty').all()).toEqual([]);
+    expect(f.store.sync('task')!.source_seq).toBeGreaterThan(0);
+    expect(f.store.snapshot('task').records.find(row => row.payload.message)?.payload.message.blocks[0].text).toBe('Original');
+    expect(fs.readdirSync(path.join(f.directory, 'remote-projection-staging'))).toEqual([]);
+  });
+  it('projects a task when the initialized library has no artifact relations', async () => {
+    const f = fixture(true, true);
+    await f.store.flushProjections();
+    expect(f.db.prepare('SELECT * FROM remote_projection_failures').all()).toEqual([]);
+    expect(f.store.snapshot('task').records.find(row => row.payload.message)?.payload.message.blocks).toEqual([{ type: 'markdown', text: 'Original' }]);
   });
   it('isolates a corrupt remote display cache and preserves corrupt execution evidence on startup', async () => {
     const f = fixture(false);

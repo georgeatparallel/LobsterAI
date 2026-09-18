@@ -76,8 +76,9 @@ function materialize(work: ProjectionWork): { revision: number; sourceSeq: numbe
         copy('remote_state', "SELECT * FROM remote_state WHERE key LIKE 'fileOutput:%' AND json_valid(value) AND json_extract(value,'$.localSessionId')=?", [work.sessionId]);
         const artifacts = source.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='library_local_artifacts'").get();
         if (artifacts) {
-          copy('library_artifact_sessions', 'SELECT * FROM library_artifact_sessions WHERE session_id=?', [work.sessionId]);
+          // Preserve foreign-key checks: materialize artifact parents before their session relations.
           copy('library_local_artifacts', 'SELECT a.* FROM library_local_artifacts a WHERE EXISTS(SELECT 1 FROM library_artifact_sessions r WHERE r.artifact_id=a.id AND r.session_id=?)', [work.sessionId]);
+          copy('library_artifact_sessions', 'SELECT * FROM library_artifact_sessions WHERE session_id=?', [work.sessionId]);
         }
       })();
     })();

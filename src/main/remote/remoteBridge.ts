@@ -253,9 +253,10 @@ export class RemoteBridge {
     const filesDegraded = filesHealth?.degraded === true;
     const reason = recoveryRequired ? RemoteSyncHealthReason.LocalRecovery : this.connectionRemoved ? RemoteSyncHealthReason.Removed : this.quotaBlocked ? RemoteSyncHealthReason.Quota
       : (this.sessionSyncFailed || projectionFailed) ? RemoteSyncHealthReason.Projection : filesDegraded ? RemoteSyncHealthReason.Files : settings.enabled && !connected ? RemoteSyncHealthReason.Connection : undefined;
+    // History scans also run when idle; only outstanding content should change the device's visible sync status.
     const syncHealth: RemoteSyncHealth = {
       status: recoveryRequired ? RemoteSyncHealthStatus.Paused : !this.owner || !settings.enabled || this.connectionRemoved || this.quotaBlocked ? RemoteSyncHealthStatus.Paused
-        : this.sessionSyncFailed || projectionFailed || filesDegraded ? RemoteSyncHealthStatus.Degraded : this.historyWork || (pending?.count || 0) > 0 || (filesHealth?.pending || 0) > 0 ? RemoteSyncHealthStatus.Syncing : RemoteSyncHealthStatus.Idle,
+        : this.sessionSyncFailed || projectionFailed || filesDegraded ? RemoteSyncHealthStatus.Degraded : (pending?.count || 0) > 0 || (filesHealth?.pending || 0) > 0 ? RemoteSyncHealthStatus.Syncing : RemoteSyncHealthStatus.Idle,
       ...(reason ? { reason } : {}), pendingSessions: pending?.count ?? null, oldestPendingAt: pending?.oldest ? new Date(pending.oldest).toISOString() : null,
       lastSuccessfulSyncAt: this.owner ? this.deps.store.get<string>(`lastSuccessfulSync:${this.owner.userId}:${this.owner.scopeKey}`) : null,
       observedAt: new Date().toISOString(),
