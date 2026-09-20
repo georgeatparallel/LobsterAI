@@ -26,12 +26,15 @@ import { store } from '../store';
 import {
   clearProfileSummary,
   invalidateAuthAccountContext,
+  type LowCreditPurchaseOffer,
+  type ProfileSummary,
   setAuthExpired,
   setAuthLoading,
   setAuthTemporarilyUnavailable,
   setLoggedIn,
   setLoggedOut,
   setProfileSummary,
+  updatePurchaseOffer,
   updateQuota,
   type UserProfile,
   type UserQuota,
@@ -44,6 +47,7 @@ import {
 } from '../store/slices/modelSlice';
 import { i18nService } from './i18n';
 import { LogReporterAction, reportYdAnalyzer } from './logReporter';
+import { getCreditQuotaSnapshot } from './lowCreditPurchaseOffer';
 import {
   clearPendingPublishingConversionAttribution,
   reportPendingPublishingSubscriptionObserved,
@@ -298,6 +302,7 @@ class AuthService {
     promise: Promise<boolean>;
   } | null = null;
   private serverModelLoadSequence = 0;
+  private quotaRefreshSequence = 0;
   private lastRefreshTime = 0;
   private loginAttemptSequence = 0;
   private enterpriseQuotaBoundaryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -306,6 +311,7 @@ class AuthService {
   private applyAuthenticatedState(
     user: UserProfile,
     quota: UserQuota | null | undefined,
+    purchaseOffer: LowCreditPurchaseOffer | null | undefined,
     enterpriseContext: EnterpriseAccountContext | null | undefined,
   ): void {
     const isEnterpriseAccount = (
@@ -338,9 +344,11 @@ class AuthService {
       // while setServerModels replaces the list atomically on success.
       store.dispatch(clearServerModels());
     }
+    this.quotaRefreshSequence += 1;
     store.dispatch(setLoggedIn({
       user,
       quota: quota ?? null,
+      purchaseOffer: purchaseOffer ?? null,
       ownerAccountKey,
     }));
     const publishingRecoveryAuthSnapshot = {
@@ -441,6 +449,7 @@ class AuthService {
         if (
           forcePublishingRecoveryRefresh
           || quotaBoundaryReached
+          || store.getState().auth.purchaseOffer
           || now - this.lastRefreshTime > 30_000
         ) {
           this.lastRefreshTime = now;
@@ -514,6 +523,7 @@ class AuthService {
         this.applyAuthenticatedState(
           result.user,
           result.quota,
+          result.purchaseOffer,
           result.enterpriseContext,
         );
         await this.loadServerModels();
@@ -574,7 +584,7 @@ class AuthService {
             enterpriseContext: store.getState().enterpriseAccount.context,
           };
         }
-        this.applyAuthenticatedState(result.user, result.quota, enterpriseContext);
+        this.applyAuthenticatedState(result.user, result.quota, result.purchaseOffer, enterpriseContext);
         await this.loadServerModels();
         void this.fetchProfileSummary();
         if (options.reportLifecycle) {
@@ -655,18 +665,38 @@ class AuthService {
     ) {
       return false;
     }
+    const refreshSequence = ++this.quotaRefreshSequence;
+    const isCurrentRefresh = () => (
+      refreshSequence === this.quotaRefreshSequence
+      && isAuthAccountRequestCurrent(authStateAtStart, store.getState().auth)
+    );
     try {
       const result = await window.electron.auth.getQuota();
-      const currentAuthState = store.getState().auth;
-      if (
-        !currentAuthState.isLoggedIn
-        || currentAuthState.ownerAccountKey !== authStateAtStart.ownerAccountKey
-        || currentAuthState.accountGeneration !== authStateAtStart.accountGeneration
-      ) {
+      if (!isCurrentRefresh()) {
         writeAuthRendererLog('debug', 'discarded stale quota response after auth state changed');
         return false;
       }
       if (result.success) {
+        let profileSummary: ProfileSummary | null = null;
+        const isEnterpriseAccount = (
+          result.enterpriseContext
+          || result.quota?.accountMode === EnterpriseAccountMode.Enterprise
+          || result.quota?.subscriptionStatus === AuthSubscriptionStatus.Enterprise
+          || authStateAtStart.user.accountMode === EnterpriseAccountMode.Enterprise
+        );
+        if (!isEnterpriseAccount && !getCreditQuotaSnapshot(result.purchaseOffer)) {
+          try {
+            const summaryResult = await window.electron.auth.getProfileSummary();
+            if (summaryResult.success && summaryResult.data) profileSummary = summaryResult.data;
+          } catch (error) {
+            writeAuthRendererLog('warn', 'credit balance fallback refresh failed', error);
+          }
+        }
+        if (!isCurrentRefresh()) {
+          writeAuthRendererLog('debug', 'discarded stale quota response after balance refresh');
+          return false;
+        }
+        const currentAuthState = store.getState().auth;
         if (result.quota) {
           store.dispatch(updateQuota(result.quota));
           const publishingRecoveryAuthSnapshot = {
@@ -679,6 +709,10 @@ class AuthService {
           void reportPendingPublishingSubscriptionObserved(publishingRecoveryAuthSnapshot);
           observePublishingSubscriptionRecoveryAuthSnapshot(publishingRecoveryAuthSnapshot);
         }
+        store.dispatch(updatePurchaseOffer({
+          purchaseOffer: result.purchaseOffer ?? null,
+          profileSummary,
+        }));
         if (result.enterpriseContext !== undefined) {
           const context = applyEnterpriseAccountContext(result.enterpriseContext);
           this.scheduleEnterpriseQuotaBoundary(context);

@@ -291,6 +291,7 @@ import {
 import { registerSessionDiagnosticsHandlers } from './ipcHandlers/sessionDiagnostics';
 import { registerSiteIpcHandlers } from './ipcHandlers/site';
 import { registerSkillHandlers } from './ipcHandlers/skills';
+import { registerSubscriptionTrialIpcHandlers } from './ipcHandlers/subscriptionTrial';
 import { LibraryIndexService } from './library/libraryIndexService';
 import { registerLibraryIpcHandlers } from './library/libraryIpc';
 import { LibraryLocalStore } from './library/libraryLocalStore';
@@ -7229,6 +7230,36 @@ if (!gotTheLock) {
     fetchWithAuth,
   });
 
+  registerSubscriptionTrialIpcHandlers({
+    ipcMain,
+    getMainWindow: () => mainWindow,
+    getServerBaseUrl: getServerApiBaseUrl,
+    getClientVersion: () => app.getVersion(),
+    platform: process.platform,
+    hasAuthTokens: () => getAuthTokens() !== null,
+    fetchPublic: (url, options) => net.fetch(url, options),
+    fetchWithAuth,
+  });
+
+  const activateLowCreditPurchaseOffer = async (): Promise<Record<string, unknown> | null> => {
+    try {
+      const response = await fetchWithAuth(`${getServerApiBaseUrl()}/api/purchase-offers/low-credit/activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (!response.ok) return null;
+      const body = (await response.json()) as {
+        code: number;
+        data?: Record<string, unknown>;
+      };
+      if (body.code !== 0 || !body.data) return null;
+      return { ...body.data, receivedAtEpochMs: Date.now() };
+    } catch (error) {
+      console.warn('[Auth] low-credit purchase offer activation failed:', error);
+      return null;
+    }
+  };
+
   ipcMain.handle(AuthIpcChannel.Exchange, async (_event, { code }: { code: string }) => {
     const startingTokens = getAuthTokens();
     const startingUser = getAuthUser();
@@ -7319,11 +7350,13 @@ if (!gotTheLock) {
         `[Auth] exchange completed; enterpriseContext=${enterpriseContext ? 'present' : 'absent'}`,
       );
       const quota = normalizeQuota(body.data.quota);
+      const purchaseOffer = await activateLowCreditPurchaseOffer();
       syncOpenClawConfigIfAuthQuotaGateChanged(startingQuotaGateState);
       return {
         success: true,
         user: body.data.user,
         quota,
+        purchaseOffer,
         enterpriseContext,
       };
     } catch (error) {
@@ -7472,11 +7505,13 @@ if (!gotTheLock) {
         `[Auth] profile refresh completed; quota=${quota ? 'present' : 'absent'}; `
         + `enterpriseContext=${enterpriseContext ? 'present' : 'absent'}`,
       );
+      const purchaseOffer = await activateLowCreditPurchaseOffer();
       return {
         success: true,
         status: AuthSessionStatus.Authenticated,
         user: profileBody.data,
         quota,
+        purchaseOffer,
         enterpriseContext,
       };
     } catch (error) {
@@ -7517,9 +7552,12 @@ if (!gotTheLock) {
       syncOpenClawConfigIfAuthQuotaGateChanged(previousQuotaGateState);
       const enterpriseContextResult = await refreshEnterpriseAccountContext();
       if (authAccountGeneration !== requestAccountGeneration) return { success: false };
+      const purchaseOffer = await activateLowCreditPurchaseOffer();
+      if (authAccountGeneration !== requestAccountGeneration) return { success: false };
       return {
         success: true,
         quota,
+        purchaseOffer,
         enterpriseContext: enterpriseContextResult.context,
       };
     } catch {

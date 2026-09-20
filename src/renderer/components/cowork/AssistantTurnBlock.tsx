@@ -1,5 +1,6 @@
 import { ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, FolderIcon } from '@heroicons/react/24/outline';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useSelector } from 'react-redux';
 
 import { classifyErrorKey, CoworkErrorI18nKey } from '../../../common/coworkErrorClassify';
 import { ContextCompactionStatus } from '../../../common/coworkSystemMessages';
@@ -11,9 +12,22 @@ import {
   parseCoworkErrorDetail,
 } from '../../../shared/cowork/errorDetail';
 import type { CoworkGoal } from '../../../shared/cowork/goal';
+import purchaseOfferFirstBadge from '../../assets/purchase-offer-first.svg';
+import purchaseOfferLimitedBadge from '../../assets/purchase-offer-limited.svg';
 import { dedupeArtifactsForDisplay } from '../../services/artifactParser';
 import { getPortalPricingUrl } from '../../services/endpoints';
 import { i18nService } from '../../services/i18n';
+import { type LogEventAction, LogReporterAction } from '../../services/logReporter';
+import { LowCreditOfferVariant, reportLowCreditPurchaseEvent } from '../../services/lowCreditPurchaseAnalytics';
+import {
+  formatPurchaseOfferDiscount,
+  getPurchaseOfferDiscountRate,
+  getPurchaseOfferPortalTab,
+  getPurchaseOfferRemainingMs,
+  isPurchaseOfferActive,
+} from '../../services/lowCreditPurchaseOffer';
+import type { RootState } from '../../store';
+import type { LowCreditPurchaseOffer } from '../../store/slices/authSlice';
 import type { Artifact } from '../../types/artifact';
 import type { CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
 import { revealLocalPathWithToast } from '../../utils/localFileActions';
@@ -22,6 +36,8 @@ import AbnormalIcon from '../icons/AbnormalIcon';
 import ExclamationTriangleIcon from '../icons/ExclamationTriangleIcon';
 import InformationCircleIcon from '../icons/InformationCircleIcon';
 import MarkdownContent from '../MarkdownContent';
+import PurchaseOfferCountdown from '../PurchaseOfferCountdown';
+import { useLowCreditOfferExposure } from '../useLowCreditOfferExposure';
 import ActivityGroupBlock from './ActivityGroupBlock';
 import AssistantMessageItem from './AssistantMessageItem';
 import { reportConversationBlockAction } from './conversationAnalytics';
@@ -282,9 +298,56 @@ const logCreditQuotaBannerEvent = (
   }
 };
 
-const CreditQuotaExhaustedBanner: React.FC = () => {
+const CreditQuotaExhaustedBanner: React.FC<{ offer: LowCreditPurchaseOffer | null; creditsRemaining: number }> = ({ offer, creditsRemaining }) => {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const currentTime = Date.now();
+    setNow(currentTime);
+    if (!offer?.expiresAtEpochMs) return undefined;
+    const remainingMs = getPurchaseOfferRemainingMs(offer, currentTime);
+    if (remainingMs <= 0) return undefined;
+    const timer = window.setTimeout(() => setNow(Date.now()), remainingMs + 1);
+    return () => window.clearTimeout(timer);
+  }, [offer]);
+  const portalTab = offer ? getPurchaseOfferPortalTab(offer) : 'subscription';
+  const rate = offer
+    ? getPurchaseOfferDiscountRate(offer, portalTab === 'boost' ? 'boost_pack' : 'subscription')
+    : null;
+  const hasOffer = isPurchaseOfferActive(offer, now) && rate !== null;
+  const isFirstPurchase = hasOffer && offer?.offerType === 'first_purchase';
+  const displayVariant = !hasOffer
+    ? LowCreditOfferVariant.NoDiscount
+    : isFirstPurchase
+      ? LowCreditOfferVariant.FirstPurchase
+      : LowCreditOfferVariant.LimitedDiscount;
+  const exposureKey = [
+    displayVariant,
+    displayVariant === LowCreditOfferVariant.NoDiscount ? '' : offer?.campaignCode,
+    displayVariant === LowCreditOfferVariant.NoDiscount ? '' : offer?.offerToken,
+    displayVariant === LowCreditOfferVariant.NoDiscount ? '' : offer?.windowCount,
+  ].join(':');
+  const report = (action: LogEventAction, offerTokenAttached?: boolean): void => {
+    reportLowCreditPurchaseEvent(action, {
+      offer,
+      variant: displayVariant,
+      creditsRemaining,
+      boostDiscountRate: hasOffer && portalTab === 'boost' ? rate : undefined,
+      subscriptionDiscountRate: hasOffer && portalTab === 'subscription' ? rate : undefined,
+      portalTab,
+      offerTokenAttached,
+    });
+  };
+  const { elementRef, ensureExposure } = useLowCreditOfferExposure(exposureKey, () => {
+    report(LogReporterAction.LowCreditTaskOfferExposure);
+  });
   const handlePurchase = async () => {
-    const pricingUrl = getPortalPricingUrl();
+    const active = isPurchaseOfferActive(offer) && rate !== null;
+    const pricingUrl = getPortalPricingUrl(undefined, {
+      offerToken: active ? offer?.offerToken ?? undefined : undefined,
+      tab: portalTab,
+    });
+    ensureExposure();
+    report(LogReporterAction.LowCreditTaskPurchaseClick, active);
     logCreditQuotaBannerEvent('debug', 'purchase action clicked');
     try {
       const result = await window.electron?.shell?.openExternal(pricingUrl);
@@ -300,14 +363,36 @@ const CreditQuotaExhaustedBanner: React.FC = () => {
   };
 
   return (
-    <div className="rounded-lg border border-border bg-background px-4 py-3 shadow-sm">
+    <div ref={elementRef} className="rounded-xl bg-surface px-4 py-3 shadow-sm">
       <div className="flex items-center gap-3">
-        <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-md bg-surface-raised text-secondary">
-          <AbnormalIcon className="h-6 w-6" />
-        </div>
+        {hasOffer ? (
+          <div className="relative h-14 w-14 shrink-0">
+            <img
+              src={isFirstPurchase ? purchaseOfferFirstBadge : purchaseOfferLimitedBadge}
+              alt=""
+              className="h-full w-full object-contain"
+            />
+            <div className="absolute inset-0 flex flex-col items-center justify-center pt-0.5 text-[10px] font-semibold leading-3 text-white">
+              <span>{i18nService.t(isFirstPurchase ? 'lowCreditOfferBadgeFirstTop' : 'lowCreditOfferBadgeLimitedTop')}</span>
+              <span>{i18nService.t(isFirstPurchase ? 'lowCreditOfferBadgeFirstBottom' : 'lowCreditOfferBadgeLimitedBottom')}</span>
+            </div>
+          </div>
+        ) : (
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-surface-raised text-secondary">
+            <AbnormalIcon className="h-6 w-6" />
+          </div>
+        )}
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-semibold leading-5 text-foreground">
-            {i18nService.t('coworkCreditQuotaBannerTitle')}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <div className="text-sm font-semibold leading-5 text-foreground">
+              {hasOffer && rate !== null
+                ? i18nService.t(isFirstPurchase ? 'lowCreditOfferTaskFirstTitle' : 'lowCreditOfferTaskReturningTitle')
+                  .replace('{discount}', formatPurchaseOfferDiscount(rate))
+                : i18nService.t('coworkCreditQuotaBannerTitle')}
+            </div>
+            {hasOffer && !isFirstPurchase && offer && (
+              <PurchaseOfferCountdown offer={offer} />
+            )}
           </div>
           <div className="mt-1 text-xs leading-5 text-secondary">
             {i18nService.t('coworkCreditQuotaBannerDescription')}
@@ -316,7 +401,7 @@ const CreditQuotaExhaustedBanner: React.FC = () => {
         <button
           type="button"
           onClick={handlePurchase}
-          className="ml-2 inline-flex h-8 flex-shrink-0 items-center justify-center rounded-full bg-foreground px-5 text-xs font-medium text-background transition-opacity hover:opacity-85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+          className="ml-2 inline-flex h-8 shrink-0 items-center justify-center rounded-full bg-foreground px-5 text-xs font-medium text-background transition-opacity hover:opacity-85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
         >
           {i18nService.t('coworkCreditQuotaBannerAction')}
         </button>
@@ -508,11 +593,16 @@ const AssistantTurnBlock: React.FC<{
   isStreamingTurn = false,
   hasRunningSubagents = false,
 }) => {
+  const creditQuotaSnapshot = useSelector((state: RootState) => state.auth.creditQuotaSnapshot);
+  const hideCreditQuotaBanner = !creditQuotaSnapshot || creditQuotaSnapshot.creditsRemaining > 0;
   const [artifactCardsExpanded, setArtifactCardsExpanded] = useState(false);
   const [processExpanded, setProcessExpanded] = useState(false);
   const visibleAssistantItems = useMemo(
-    () => getVisibleAssistantItems(turn.assistantItems),
-    [turn.assistantItems],
+    () => getVisibleAssistantItems(turn.assistantItems).filter(item => {
+      if (!hideCreditQuotaBanner || item.type !== 'system') return true;
+      return !isCreditQuotaExhaustedKey(getSystemMessageErrorKey(item.message, item.message.content));
+    }),
+    [turn.assistantItems, hideCreditQuotaBanner],
   );
   const consolidatedItems = useMemo(
     () => consolidateMediaPolling(visibleAssistantItems),
@@ -581,7 +671,9 @@ const AssistantTurnBlock: React.FC<{
     const normalizedContent = getScheduledReminderDisplayText(rawContent) ?? rawContent;
     const errorKey = getSystemMessageErrorKey(message, normalizedContent);
     if (isCreditQuotaExhaustedKey(errorKey)) {
-      return <CreditQuotaExhaustedBanner />;
+      return hideCreditQuotaBanner
+        ? null
+        : <CreditQuotaExhaustedBanner offer={creditQuotaSnapshot.purchaseOffer} creditsRemaining={creditQuotaSnapshot.creditsRemaining} />;
     }
     const displayContent = getSystemMessageDisplayContent(message, normalizedContent);
     const content = mapDisplayText ? mapDisplayText(displayContent) : displayContent;
@@ -877,6 +969,10 @@ const AssistantTurnBlock: React.FC<{
     });
     setProcessExpanded(nextExpanded);
   };
+
+  if (renderChunks.length === 0 && !showActivityIndicator && !artifacts?.length) {
+    return null;
+  }
 
   return (
     <div className={`py-2 ${COWORK_DETAIL_GUTTER_CLASS}`}>

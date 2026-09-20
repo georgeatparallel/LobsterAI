@@ -49,6 +49,7 @@ import { SkillsAndConnectorsView, SkillsConnectorsSection } from './components/s
 import SkinBackdrop, { SkinBackdropVariant } from './components/skin/SkinBackdrop';
 import SkinPresentationScope from './components/skin/SkinPresentationScope';
 import StartupCreditCampaign from './components/StartupCreditCampaign';
+import SubscriptionTrialCampaign from './components/SubscriptionTrialCampaign';
 import Toast, { type ToastEventDetail } from './components/Toast';
 import AppUpdateBadge from './components/update/AppUpdateBadge';
 import AppUpdateBlockingPanel from './components/update/AppUpdateBlockingPanel';
@@ -257,6 +258,7 @@ const App: React.FC = () => {
   const [isUpdateCardExpanded, setIsUpdateCardExpanded] = useState(false);
   const [isUserInitiatedUpdateFlowActive, setIsUserInitiatedUpdateFlowActive] = useState(false);
   const [privacyAgreed, setPrivacyAgreed] = useState<boolean | null>(null);
+  const [trialTaskCreatedSignal, setTrialTaskCreatedSignal] = useState(0);
   const [newUserOnboardingStep, setNewUserOnboardingStep] =
     useState<NewUserOnboardingStepType>(NewUserOnboardingStep.NewTask);
   const [isNewUserOnboardingDismissed, setIsNewUserOnboardingDismissed] = useState(false);
@@ -907,6 +909,7 @@ const App: React.FC = () => {
   }, [isSidebarCollapsed, mainView]);
 
   const handleNewChat = useCallback(() => {
+    setTrialTaskCreatedSignal(value => value + 1);
     // Only clear when already on home (no session) — preserve __home__ draft when returning from a session
     const shouldClearInput = mainView === 'cowork' && !currentSessionId;
     coworkService.clearSession({ restoreAgentSkills: true });
@@ -2097,6 +2100,11 @@ const App: React.FC = () => {
           onClose={() => setToastMessage(null)}
         />
       )}
+      <SubscriptionTrialCampaign
+        privacyAgreed={privacyAgreed}
+        taskCreatedSignal={trialTaskCreatedSignal}
+        enabled={privacyAgreed === true && !isEnterpriseAccount && !isOverlayActive && hasResolvedEngineStartupOverlayState && !isEngineStartupOverlayVisible}
+      />
       <StartupCreditCampaign
         enabled={privacyAgreed === true && !isEnterpriseAccount}
       />

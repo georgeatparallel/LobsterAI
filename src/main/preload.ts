@@ -131,6 +131,7 @@ import type {
   SkinGetActiveResponse,
   SkinListResponse,
 } from '../shared/skin/types';
+import { SubscriptionTrialIpc } from '../shared/subscriptionTrial/constants';
 import { NimQrLoginIpc } from './ipcHandlers/nimQrLogin';
 import { OpenClawSessionIpc } from './openclawSession/constants';
 import { OpenClawSessionPolicyIpc } from './openclawSessionPolicy/constants';
@@ -1101,6 +1102,9 @@ contextBridge.exposeInMainWorld('electron', {
     relaunch: () => ipcRenderer.invoke('app:relaunch'),
     openSystemNotificationSettings: () =>
       ipcRenderer.invoke(AppIpcChannel.OpenSystemNotificationSettings),
+  },
+  subscriptionTrial: {
+    status: () => ipcRenderer.invoke(SubscriptionTrialIpc.Status),
   },
   activity: {
     getSlot: (input: ActivityHostGetSlotInput) =>
