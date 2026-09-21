@@ -498,8 +498,9 @@ const { data } = JSON.parse(process.argv[2]);
 console.log(`# Search Results: ${data.query}\n\n**Query:** ${data.query}  \n**Engine:** ${data.engine}  \n**Results:** ${data.totalResults}  \n**Time:** ${data.duration}ms\n`);
 for (const warning of data.warnings || []) console.log(`**Warning:** ${warning}\n`);
 for (const result of data.results) {
-  const target = result.url.replace(/\(/g, '%28').replace(/\)/g, '%29');
-  console.log(`---\n\n## ${result.title}\n\n**URL:** [${result.url}](${target})\n\n${result.snippet}\n`);
+  const label = result.url.replace(/[\\`*_\[\]<>&]/g, '\\$&');
+  const target = new URL(result.url).href.replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/&/g, '&amp;');
+  console.log(`---\n\n## ${result.title}\n\n**URL:** [${label}](${target})\n\n${result.snippet}\n`);
 }
 NODE
     return $?

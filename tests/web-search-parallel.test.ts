@@ -3,6 +3,8 @@ import { createServer, Server } from 'node:http';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import remarkParse from 'remark-parse';
+import { unified } from 'unified';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
 import { BridgeServer } from '../SKILLs/web-search/server';
@@ -156,6 +158,25 @@ describe('native optional Parallel search', () => {
     expect(google).toHaveBeenCalledOnce();
     expect(bing).toHaveBeenCalledOnce();
     expect(requests).toEqual([]);
+  });
+
+  test.each([
+    'https://example.com/release notes',
+    'https://example.com/q?value=[unclosed',
+    'https://example.com/q?value=&copy;',
+  ])('CLI renders a complete citation for source URL %s', async (sourceUrl) => {
+    await fixture({ result: { content: [], structuredContent: { results: [{ ...page, url: sourceUrl }] } } });
+    const output = await run('bash', [path.resolve('SKILLs/web-search/scripts/search.sh'), 'public reference'], {
+      env: { PATH: process.env.PATH, WEB_SEARCH_SERVER: await bridge(), WEB_SEARCH_ENGINE: SearchEngine.Parallel },
+    });
+    const tree = unified().use(remarkParse).parse(output.stdout);
+    const links = tree.children.flatMap((node) => node.type === 'paragraph'
+      ? node.children.filter((child) => child.type === 'link') : []);
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({
+      url: new URL(sourceUrl).href,
+      children: [{ type: 'text', value: sourceUrl }],
+    });
   });
 
   test.each([SearchEngine.Google, SearchEngine.Bing])('explicit %s preserves selection without Parallel requests', async (engine) => {
