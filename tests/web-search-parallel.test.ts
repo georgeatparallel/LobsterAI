@@ -3,6 +3,8 @@ import { createServer, Server } from 'node:http';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
+import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
@@ -16,6 +18,7 @@ import {
   PARALLEL_ENDPOINT, PARALLEL_MAX_RESPONSE_BYTES, PARALLEL_USER_AGENT, ParallelSearch,
 } from '../SKILLs/web-search/server/search/parallel';
 import { SearchEngine, SearchResponse } from '../SKILLs/web-search/server/search/types';
+import { convertLatexMathDelimiters } from '../src/renderer/components/MarkdownContent';
 
 vi.mock('../SKILLs/web-search/server/playwright/browser', async (importOriginal) => ({
   ...await importOriginal<typeof browser>(),
@@ -163,13 +166,22 @@ describe('native optional Parallel search', () => {
   test.each([
     'https://example.com/release notes',
     'https://example.com/q?value=[unclosed',
+    'https://example.com/q?value=[balanced]',
     'https://example.com/q?value=&copy;',
+    'https://example.com/q?value=$literal$',
+    'https://example.com/q?value=~~literal~~',
+    'https://example.com/q?value=\\*',
+    'https://example.com/q?value=\\\\',
+    'https://example.com/q?value=\\&copy;',
+    'https://example.com/reference_(draft)?value=(unclosed',
+    'https://example.com/q?value=\\)&literal=&amp;#fragment\\*',
+    'https://example.com/q?value=\\[\\]\\(\\)\\`\\!\\_\\~',
   ])('CLI renders a complete citation for source URL %s', async (sourceUrl) => {
     await fixture({ result: { content: [], structuredContent: { results: [{ ...page, url: sourceUrl }] } } });
     const output = await run('bash', [path.resolve('SKILLs/web-search/scripts/search.sh'), 'public reference'], {
       env: { PATH: process.env.PATH, WEB_SEARCH_SERVER: await bridge(), WEB_SEARCH_ENGINE: SearchEngine.Parallel },
     });
-    const tree = unified().use(remarkParse).parse(output.stdout);
+    const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).parse(convertLatexMathDelimiters(output.stdout));
     const links = tree.children.flatMap((node) => node.type === 'paragraph'
       ? node.children.filter((child) => child.type === 'link') : []);
     expect(links).toHaveLength(1);
@@ -177,6 +189,20 @@ describe('native optional Parallel search', () => {
       url: new URL(sourceUrl).href,
       children: [{ type: 'text', value: sourceUrl }],
     });
+  });
+
+  test.each(['```ts', '~~~ts'])('a truncated %s excerpt fence does not swallow the next source citation', async (fence) => {
+    await fixture({ result: { content: [], structuredContent: { results: [
+      { ...page, excerpts: [`An example:\n${fence}\n${'x'.repeat(6000)}\n${fence}`] },
+      { ...page, url: `${page.url}/next` },
+    ] } } });
+    const output = await run('bash', [path.resolve('SKILLs/web-search/scripts/search.sh'), 'public reference'], {
+      env: { PATH: process.env.PATH, WEB_SEARCH_SERVER: await bridge(), WEB_SEARCH_ENGINE: SearchEngine.Parallel },
+    });
+    const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).parse(convertLatexMathDelimiters(output.stdout));
+    const links = tree.children.flatMap((node) => node.type === 'paragraph'
+      ? node.children.filter((child) => child.type === 'link') : []);
+    expect(links.map((link) => link.url)).toEqual([page.url, `${page.url}/next`]);
   });
 
   test.each([SearchEngine.Google, SearchEngine.Bing])('explicit %s preserves selection without Parallel requests', async (engine) => {

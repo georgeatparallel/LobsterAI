@@ -495,12 +495,14 @@ search() {
     fi
     env "${HTTP_NODE_ENV_PREFIX[@]}" "$HTTP_NODE_CMD" "${HTTP_NODE_ARGS[@]}" - "$SEARCH_RESPONSE" <<'NODE'
 const { data } = JSON.parse(process.argv[2]);
-console.log(`# Search Results: ${data.query}\n\n**Query:** ${data.query}  \n**Engine:** ${data.engine}  \n**Results:** ${data.totalResults}  \n**Time:** ${data.duration}ms\n`);
-for (const warning of data.warnings || []) console.log(`**Warning:** ${warning}\n`);
+// Entities preserve literal evidence through Markdown and LobsterAI math normalization.
+const markdownText = (text) => text.replace(/[\\`*_~$\[\]()<>&#|]/g, (character) => `&#${character.charCodeAt(0)};`);
+console.log(`# Search Results: ${markdownText(data.query)}\n\n**Query:** ${markdownText(data.query)}  \n**Engine:** ${data.engine}  \n**Results:** ${data.totalResults}  \n**Time:** ${data.duration}ms\n`);
+for (const warning of data.warnings || []) console.log(`**Warning:** ${markdownText(warning)}\n`);
 for (const result of data.results) {
-  const label = result.url.replace(/[\\`*_\[\]<>&]/g, '\\$&');
-  const target = new URL(result.url).href.replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/&/g, '&amp;');
-  console.log(`---\n\n## ${result.title}\n\n**URL:** [${label}](${target})\n\n${result.snippet}\n`);
+  const label = markdownText(result.url);
+  const target = markdownText(new URL(result.url).href);
+  console.log(`---\n\n## ${markdownText(result.title)}\n\n**URL:** [${label}](${target})\n\n${markdownText(result.snippet)}\n`);
 }
 NODE
     return $?
