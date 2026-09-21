@@ -218,7 +218,7 @@ export class SessionCommandService {
   constructor(private readonly store: CoworkStore, private readonly runtime: CoworkRuntime, private readonly getOwner: () => RemoteOwner | null,
     private readonly ownershipOptions: { gate?: OwnershipOperationGate; getGeneration?: () => number | string; onRecovered?: (sessionId: string) => void } = {}) {
     runtime.on('sessionStatus', (id, status) => {
-      if (status !== 'running') return;
+      if (status !== 'running' || !store.remote.db.prepare('SELECT 1 FROM cowork_sessions WHERE id=?').get(id)) return;
       // Anonymous tasks also need per-run approval identity; ownership still controls upload.
       const run = store.remote.run(id);
       if (!run || terminal.has(run.status)) store.remote.beginRun(id);
@@ -254,6 +254,7 @@ export class SessionCommandService {
     const generation = this.ownershipOptions.getGeneration?.();
     const id = create ? inherited?.preparedSessionId : options.sessionId;
     if (id) {
+      this.store.remote.assertNoDeletionEffect(id);
       this.store.remote.assertActor(id, actor);
       if (!inherited) {
         if (this.submitting.has(id) || this.configurationLane.has(id)) return { success: false, error: 'REMOTE_SESSION_BUSY' };

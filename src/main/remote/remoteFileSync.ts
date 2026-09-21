@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import type { RemoteOwner } from '../../shared/remote/constants';
+import { RemoteDeletion } from '../../shared/remote/deletions';
 import { type RemoteArtifactManifest, type RemoteFilePolicy, RemoteFileReason, remoteFileRule } from '../../shared/remote/files';
 import type { RemoteInputAsset } from '../../shared/remote/input';
 import { sameOwner, stableJson } from './canonical';
@@ -80,7 +81,7 @@ export class RemoteFileSync {
   private current(connection: Connection, sessionId?: string): boolean {
     return this.enabled && this.deps.enabled() && sameOwner(connection.owner, this.deps.owner())
       && connection.environment === this.deps.environment() && this.connection?.generation === connection.generation
-      && this.connection.deviceId === connection.deviceId && (!sessionId || sameOwner(this.deps.store.owner(sessionId), connection.owner));
+      && this.connection.deviceId === connection.deviceId && (!sessionId || !this.deps.store.get(`${RemoteDeletion.Closed}${sessionId}`) && sameOwner(this.deps.store.owner(sessionId), connection.owner));
   }
   private assert(connection: Connection, sessionId?: string): void { if (!this.current(connection, sessionId)) throw new Error(RemoteFileReason.Access); }
   tick(connection: Connection): void {
@@ -129,6 +130,7 @@ export class RemoteFileSync {
     if (!this.policy?.features.artifactPublish || !this.current(connection)) return;
     await this.observe(connection);
     for (const { key, value: job } of this.deps.store.entries<ArtifactJob>(this.prefix(connection))) {
+      if (this.deps.store.get(`${RemoteDeletion.Closed}${job.localSessionId}`)) continue;
       if (!this.current(connection, job.localSessionId)) return;
       this.fileHealth.pending = (this.fileHealth.pending || 0) + job.queue.length + (job.rename ? 1 : 0);
       if (job.reason) this.fileHealth.degraded = true;
@@ -146,6 +148,7 @@ export class RemoteFileSync {
         await this.publish(connection, key, job);
       }
       catch (error) {
+        if (this.deps.store.get(`${RemoteDeletion.Closed}${job.localSessionId}`)) continue;
         if (!this.current(connection, job.localSessionId)) return;
         this.fileHealth.degraded = true;
         job.reason = error instanceof Error ? error.message : RemoteFileReason.Transfer; job.retryAt = Date.now() + 60_000;

@@ -114,6 +114,7 @@ export type CoworkIpcChannel = typeof CoworkIpcChannel[keyof typeof CoworkIpcCha
 
 export interface CoworkSessionsChangedPayload {
   sessionIds: string[];
+  deletedSessionIds?: string[];
 }
 
 export const CoworkOnboardingMessageKind = {

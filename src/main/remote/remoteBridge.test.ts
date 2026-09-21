@@ -256,6 +256,71 @@ describe('session synchronization recovery', () => {
     expect(store.sync('sync-task')!.ack_seq).toBe(0);
   });
 
+  for (const localExists of [true, false]) it(`stops retrying a remotely deleted session while preserving its local state (local exists: ${localExists})`, async () => {
+    const { bridge, store, requestApi } = syncing();
+    store.transaction(() => {
+      store.db.prepare("INSERT INTO cowork_messages VALUES ('retained-message','sync-task','assistant','Keep local content',NULL,1,1)").run();
+      store.project('sync-task');
+    });
+    if (!localExists) {
+      store.transaction(() => { store.db.prepare('DELETE FROM cowork_sessions WHERE id=?').run('sync-task'); store.project('sync-task'); });
+    }
+    const pending = store.pending('sync-task');
+    const before = store.sync('sync-task')!;
+    const messages = store.db.prepare('SELECT * FROM cowork_messages WHERE session_id=?').all('sync-task');
+    requestApi.mockRejectedValueOnce(new RemoteApiError(47010, 'Session deleted', { reason: 'SESSION_DELETED' }, 410));
+    await bridge.syncSessions();
+    const savedImport = store.get('import:sync-task');
+    expect(savedImport).not.toBeNull();
+    expect(store.get('syncFailure:sync-task')).toMatchObject({ code: 47010, httpStatus: 410, reason: 'SESSION_DELETED', blocked: true });
+    await bridge.syncSessions();
+    expect(requestApi).toHaveBeenCalledTimes(1);
+
+    const restarted: any = new RemoteBridge(bridge.deps); bridges.push(restarted);
+    restarted.owner = owner; restarted.registration = { ...bridge.registration }; restarted.generation = '1';
+    await restarted.syncSessions();
+    expect(requestApi).toHaveBeenCalledTimes(1);
+    expect(store.pending('sync-task')).toEqual(pending);
+    expect(store.sync('sync-task')).toMatchObject({ session_id: before.session_id, ack_seq: before.ack_seq, source_seq: before.source_seq });
+    expect(store.get('import:sync-task')).toEqual(savedImport);
+    expect(!!store.db.prepare('SELECT 1 FROM cowork_sessions WHERE id=?').get('sync-task')).toBe(localExists);
+    expect(store.db.prepare('SELECT * FROM cowork_messages WHERE session_id=?').all('sync-task')).toEqual(messages);
+
+    store.transaction(() => {
+      store.db.prepare("INSERT INTO cowork_sessions VALUES ('healthy-task','Other',1,1,'idle')").run();
+      store.assignNew('healthy-task', owner, 'local_create');
+    });
+    requestApi.mockImplementation(async (_owner, pathname) => {
+      const saved = store.get<any>('import:healthy-task')!;
+      expect(saved).not.toBeNull();
+      const data = { sessionId: saved.sessionId, committedSourceSeq: saved.baseSourceSeq, committedSeq: '1', stateVersion: '1', state: 'committed' };
+      expect(pathname).toBe('/api/remote/v1/sync/imports');
+      return new Response(JSON.stringify({ code: 0, data }));
+    });
+    await restarted.syncSessions();
+    expect(requestApi).toHaveBeenCalledTimes(2);
+    expect(store.sync('healthy-task')!.ack_seq).toBe(store.sync('healthy-task')!.source_seq);
+    expect(store.get('syncFailure:healthy-task')).toBeNull();
+    expect(store.get('import:sync-task')).toEqual(savedImport);
+    expect(store.pending('sync-task')).toEqual(pending);
+  });
+
+  for (const failure of [
+    new RemoteApiError(47010, 'Other error', { reason: 'OTHER_REASON' }, 410),
+    new RemoteApiError(47019, 'Other error', { reason: 'SESSION_DELETED' }, 410),
+    new RemoteApiError(47010, 'Other error', { reason: 'SESSION_DELETED' }, 503),
+  ]) it(`retains retries for non-deletion errors (${failure.code}/${failure.httpStatus}/${failure.data.reason})`, async () => {
+    const { bridge, store, requestApi } = syncing(true);
+    requestApi.mockRejectedValueOnce(failure);
+    await bridge.syncSessions();
+    const saved = store.get<any>('syncFailure:sync-task');
+    expect(saved.blocked).not.toBe(true);
+    store.put('syncFailure:sync-task', { ...saved, retryAt: 0 });
+    await bridge.syncSessions();
+    expect(requestApi).toHaveBeenCalledTimes(2);
+    expect(store.get('syncFailure:sync-task')).toBeNull();
+  });
+
   it('clears a previous failure when begin returns an already committed import', async () => {
     const { bridge, store, requestApi } = syncing(true);
     requestApi.mockRejectedValueOnce(new RemoteApiError(47019, 'Begin acknowledgement was lost'));

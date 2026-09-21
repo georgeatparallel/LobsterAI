@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'crypto';
 
 import { OWNERSHIP_MANUAL_SOURCE } from '../../shared/ownership/constants';
 import { REMOTE_MESSAGE_BYTES, type RemoteAgentSummary, type RemoteOwner, type RemoteRunStatusValue } from '../../shared/remote/constants';
+import { type DeletionGuard, RemoteDeletion } from '../../shared/remote/deletions';
 import { RemoteFileReason } from '../../shared/remote/files';
 import { type LocalQuestionState, RemoteQuestion, type RemoteQuestionState } from '../../shared/remote/questions';
 import { RemoteReply, RemoteReplyBlockType, type RemoteReplyContentRef, type RemoteReplyFormat, type RemoteReplyUpload } from '../../shared/remote/reply';
@@ -75,6 +76,7 @@ export class RemoteStore {
   private changeVersion = 0;
   private publishing = false;
   private artifactTracking = false;
+  private deletionProjectionSupported = false;
   private approvalProjectionSupported = false;
   private questionProjectionSupported = false;
   private inputProjectionSupported = false;
@@ -226,7 +228,7 @@ export class RemoteStore {
   flushProjections(): Promise<void> { return this.projector?.flush() || Promise.resolve(); }
   configureDetachedProjection(work: ProjectionWork): void {
     this.enabledOwner = work.owner; this.approvalProjectionSupported = work.approval; this.questionProjectionSupported = work.questions; this.inputProjectionSupported = work.input;
-    this.fileProjectionSupported = work.files; this.replyProjectionSupported = work.reply; this.fileEnvironment = work.environment;
+    this.fileProjectionSupported = work.files; this.replyProjectionSupported = work.reply; this.fileEnvironment = work.environment; this.deletionProjectionSupported = work.deletions === true;
   }
   private questionEvidenceHealthy(): boolean {
     const corrupt = this.db.prepare("SELECT 1 FROM remote_state WHERE key LIKE 'questionDecision:%' AND NOT json_valid(value) LIMIT 1").get();
@@ -248,19 +250,21 @@ export class RemoteStore {
       JOIN remote_sync s ON s.local_id=d.session_id LEFT JOIN remote_projection_failures f ON f.session_id=d.session_id
       LEFT JOIN remote_session_revisions r ON r.session_id=d.session_id
       WHERE o.ownership_status='confirmed' AND o.owner_user_id=? AND o.owner_scope_key=? AND s.migration_frozen=0
+        AND NOT EXISTS(SELECT 1 FROM remote_state closed WHERE closed.key='deletionClosed:'||s.local_id)
         AND (f.session_id IS NULL OR (f.reason<>'REMOTE_PROJECTION_BUDGET' AND f.revision<>r.revision) OR f.retry_at<=?) ORDER BY r.dirty_at,d.session_id LIMIT 1`)
       .get(this.enabledOwner.userId, this.enabledOwner.scopeKey, Date.now()) as { session_id: string } | undefined;
     if (!row) return null;
     const sync = this.sync(row.session_id)!;
+    if (this.deletionProjectionSupported) this.deletionGuard(row.session_id);
     return { database: this.db.name, target: '', sessionId: row.session_id, owner: { ...this.enabledOwner },
       deviceId: this.projectionIdentity?.deviceId || sync.device_id, environment: this.fileEnvironment || this.projectionIdentity?.environment || null,
       agent: this.agentSummary?.(row.session_id, this.enabledOwner) || null, approval: this.approvalProjectionSupported, questions: this.questionProjectionSupported,
-      input: this.inputProjectionSupported, files: this.fileProjectionSupported, reply: this.replyProjectionSupported };
+      input: this.inputProjectionSupported, files: this.fileProjectionSupported, reply: this.replyProjectionSupported, deletions: this.deletionProjectionSupported };
   }
   projectionWorkCurrent(work: ProjectionWork): boolean {
-    return sameOwner(work.owner, this.enabledOwner) && sameOwner(this.owner(work.sessionId), work.owner)
+    return !this.get(`${RemoteDeletion.Closed}${work.sessionId}`) && sameOwner(work.owner, this.enabledOwner) && sameOwner(this.owner(work.sessionId), work.owner)
       && work.approval === this.approvalProjectionSupported && work.questions === this.questionProjectionSupported && work.input === this.inputProjectionSupported
-      && work.files === this.fileProjectionSupported && work.reply === this.replyProjectionSupported
+      && work.files === this.fileProjectionSupported && work.reply === this.replyProjectionSupported && (work.deletions === true) === this.deletionProjectionSupported
       && work.deviceId === (this.projectionIdentity?.deviceId || this.sync(work.sessionId)?.device_id)
       && work.environment === (this.fileEnvironment || this.projectionIdentity?.environment || null);
   }
@@ -292,6 +296,7 @@ export class RemoteStore {
   setFileEnvironment(environment: string): void { this.fileEnvironment = environment; }
   setArtifactProjectionResolver(resolver: NonNullable<RemoteStore['artifactProjection']>): void { this.artifactProjection = resolver; }
   markFilesDirty(sessionId: string): void {
+    if (this.get(`${RemoteDeletion.Closed}${sessionId}`)) return;
     this.touchProjection(sessionId);
     this.db.prepare('INSERT OR IGNORE INTO remote_content_dirty VALUES (?)').run(sessionId);
     this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(sessionId);
@@ -311,6 +316,7 @@ export class RemoteStore {
     if (!owner) return [];
     return this.db.prepare(`SELECT o.session_id FROM cowork_session_ownership o JOIN remote_sync s ON s.local_id=o.session_id
       WHERE o.ownership_status='confirmed' AND o.owner_user_id=? AND o.owner_scope_key=?
+      AND NOT EXISTS(SELECT 1 FROM remote_state closed WHERE closed.key='deletionClosed:'||s.local_id)
       AND (?='' OR s.device_id='' OR s.device_id=?) AND (? IS NULL OR s.sync_environment IS NULL OR s.sync_environment=?)`).all(owner.userId, owner.scopeKey,
       this.projectionIdentity?.deviceId || '', this.projectionIdentity?.deviceId || '', this.projectionIdentity?.environment || null, this.projectionIdentity?.environment || null) as Array<{ session_id: string }>;
   }
@@ -501,7 +507,7 @@ export class RemoteStore {
   }
   put(key: string, value: unknown): void {
     const parts = key.split(':');
-    if (parts[1] && ['run', 'runHistory', 'control', 'approval', 'question', 'localApprovalBlocker', 'inputModel', 'inputVersion', 'inputSignature'].includes(parts[0])) this.touchProjection(parts[1]);
+    if (parts[1] && ['deletionGuard', 'run', 'runHistory', 'control', 'approval', 'question', 'localApprovalBlocker', 'inputModel', 'inputVersion', 'inputSignature'].includes(parts[0])) this.touchProjection(parts[1]);
     if (this.depth === 0 && this.advanceCheckpoint) { this.transaction(() => this.put(key, value)); return; }
     this.db.prepare('INSERT INTO remote_state VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, stableJson(value));
     if (parts[0] === 'questionDecision') {
@@ -632,14 +638,43 @@ export class RemoteStore {
     this.db.prepare('UPDATE remote_sync SET session_id=?,device_id=?,sync_environment=COALESCE(sync_environment,?) WHERE local_id=?')
       .run(remoteId, deviceId, this.projectionIdentity?.environment || null, sessionId);
   }
+  setDeletionProjectionSupported(supported: boolean): void {
+    if (this.deletionProjectionSupported === supported) return;
+    this.deletionProjectionSupported = supported;
+    for (const { session_id } of this.projectionSessions()) {
+      if (supported) this.deletionGuard(session_id);
+      this.db.prepare('INSERT OR IGNORE INTO remote_dirty VALUES (?)').run(session_id);
+    }
+  }
+  deletionGuard(sessionId: string): DeletionGuard {
+    const key = `${RemoteDeletion.Guard}${sessionId}`;
+    const saved = this.get<DeletionGuard>(key);
+    if (saved) return saved;
+    const guard = { version: '1', runId: this.run(sessionId)?.runId || null };
+    this.put(key, guard);
+    return guard;
+  }
+  assertNoDeletionEffect(sessionId: string): void {
+    const fence = this.get<{ phase: string }>(`${RemoteDeletion.Fence}${sessionId}`);
+    if (this.get(`${RemoteDeletion.Closed}${sessionId}`) || fence && [RemoteDeletion.EffectStarted, RemoteDeletion.Stopped, RemoteDeletion.Reconciling].some(phase => phase === fence.phase)) {
+      throw new Error('REMOTE_SESSION_DELETION_IN_PROGRESS');
+    }
+  }
+  advanceDeletionGuard(sessionId: string, runId?: string | null): void {
+    this.assertNoDeletionEffect(sessionId);
+    const previous = this.deletionGuard(sessionId);
+    this.put(`${RemoteDeletion.Guard}${sessionId}`, { version: String(BigInt(previous.version) + 1n), runId: runId === undefined ? previous.runId : runId });
+  }
   run(sessionId: string): RemoteRun | null { return this.get<RemoteRun>(`run:${sessionId}`); }
   controlVersion(sessionId: string): string { return this.get<string>(`control:${sessionId}`) || '0'; }
   beginRun(sessionId: string, runId: string = randomUUID(), commandId: string | null = null): RemoteRun {
     if (this.recoveringRuns) this.runtimeTouchedSessions.add(sessionId);
+    this.assertNoDeletionEffect(sessionId);
     const previous = this.run(sessionId);
     if (previous && !terminal.has(previous.status)) throw new Error('REMOTE_SESSION_BUSY');
     const run: RemoteRun = { runId, status: 'starting', statusVersion: '1', startedAt: iso(Date.now()), finishedAt: null, error: null };
     this.transaction(() => {
+      this.advanceDeletionGuard(sessionId, runId);
       this.remove(`gatewayRun:${sessionId}`);
       const runOrdinal = String(BigInt(this.get<string>(`fileRunOrdinal:${sessionId}`) || '0') + 1n);
       this.put(`fileRunOrdinal:${sessionId}`, runOrdinal);
@@ -692,6 +727,7 @@ export class RemoteStore {
   private bumpControl(sessionId: string): void { this.put(`control:${sessionId}`, String(BigInt(this.controlVersion(sessionId)) + 1n)); }
 
   requireSnapshot(sessionId: string, reason = 'local_change'): void {
+    if (this.get(`${RemoteDeletion.Closed}${sessionId}`)) return;
     this.put(`snapshotReason:${sessionId}`, reason);
     this.db.prepare('UPDATE remote_sync SET needs_snapshot=1 WHERE local_id=?').run(sessionId);
     this.put(`snapshotEpoch:${sessionId}`, (this.get<number>(`snapshotEpoch:${sessionId}`) || 0) + 1);
@@ -711,6 +747,7 @@ export class RemoteStore {
       const dirty = this.db.prepare('SELECT session_id FROM remote_dirty').all() as Array<{ session_id: string }>;
       let processed = false;
       for (const { session_id: id } of dirty) {
+        if (this.get(`${RemoteDeletion.Closed}${id}`)) { this.db.prepare('DELETE FROM remote_dirty WHERE session_id=?').run(id); this.db.prepare('DELETE FROM remote_content_dirty WHERE session_id=?').run(id); continue; }
         if (this.sync(id)?.migration_frozen) continue;
         // Consume only this marker; frozen records survive commits and process restarts.
         const contentDirty = Boolean(this.db.prepare('SELECT 1 FROM remote_content_dirty WHERE session_id=?').get(id));
@@ -808,7 +845,7 @@ export class RemoteStore {
     this.record(sessionId, `question:${question.questionId}`, { eventType: RemoteQuestion.Event, payload: { question, controlVersion: this.controlVersion(sessionId) } });
   }
   project(sessionId: string, summaryOnly = false): void {
-    if (this.sync(sessionId)?.migration_frozen) return;
+    if (this.sync(sessionId)?.migration_frozen || this.get(`${RemoteDeletion.Closed}${sessionId}`)) return;
     const s = this.db.prepare('SELECT * FROM cowork_sessions WHERE id=?').get(sessionId) as any;
     if (!s) { if (!this.get<string>(`deletedAt:${sessionId}`)) this.requireSnapshot(sessionId); const deletedAt = this.get<string>(`deletedAt:${sessionId}`) || iso(Date.now()); this.put(`deletedAt:${sessionId}`, deletedAt); this.record(sessionId, 'deleted', { eventType: 'session.deleted', payload: { deletedAt } }); return; }
     const storedRun = this.run(sessionId);
@@ -848,6 +885,7 @@ export class RemoteStore {
     recordState('session', { eventType: 'session.upsert', payload: { session: {
       sessionId: this.sync(sessionId)?.session_id, title: shortName(publicText(s.title)), origin: this.get(`origin:${sessionId}`) || 'desktop',
       workspaceId: this.get(`workspace:${sessionId}`), preview: summaryOnly ? JSON.parse(previous!.record_json).payload.session.preview : preview(publicText(latestText)), createdAt: iso(s.created_at), updatedAt: iso(s.updated_at),
+      ...(this.deletionProjectionSupported ? { deletionGuard: this.deletionGuard(sessionId) } : {}),
       localStatus: s.status, controlVersion: this.controlVersion(sessionId), run,
       ...(this.inputProjectionSupported ? { inputVersion: this.inputVersion(sessionId), inputModel: this.get(`inputModel:${sessionId}`) } : {}),
       ...(this.agentSummary && this.owner(sessionId) ? { agent: this.agentSummary(sessionId, this.owner(sessionId)!) } : {}),

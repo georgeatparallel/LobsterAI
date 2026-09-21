@@ -2161,6 +2161,7 @@ export class CoworkStore {
     const sequence = seqRow?.next_seq ?? 1;
 
     this.writeSessionProjections([sessionId], () => {
+      if (message.type === 'user') this.remote.advanceDeletionGuard(sessionId);
       this.db
         .prepare(
           `
@@ -2283,6 +2284,7 @@ export class CoworkStore {
     const now = Date.now();
 
     this.writeSessionProjections([sessionId], () => {
+      this.remote.advanceDeletionGuard(sessionId);
       const existingRows = this.db
         .prepare(
           `
@@ -2371,6 +2373,7 @@ export class CoworkStore {
     const now = Date.now();
 
     this.writeSessionProjections([sessionId], () => {
+      this.remote.advanceDeletionGuard(sessionId);
       this.db
         .prepare(
           "DELETE FROM cowork_messages WHERE session_id = ? AND type IN ('user', 'assistant', 'tool_use', 'tool_result')",

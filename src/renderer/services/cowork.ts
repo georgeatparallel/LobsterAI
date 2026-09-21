@@ -537,6 +537,12 @@ class CoworkService {
     // Sessions changed listener (new channel sessions discovered by polling,
     // or reconcileWithHistory replaced messages for a channel session)
     const sessionsChangedCleanup = cowork.onSessionsChanged((payload) => {
+      const deletedIds = payload?.deletedSessionIds || [];
+      if (deletedIds.length) {
+        ++this.latestLoadSessionRequestId; ++this.latestLoadSessionsRequestId; ++this.messageWindowRequestGeneration;
+        deletedIds.forEach(id => this.queuedFollowUpCoordinator.clearSession(id));
+        store.dispatch(deleteSessionsAction(deletedIds));
+      }
       const beforeState = store.getState().cowork;
       const changedSessionIds = Array.isArray(payload?.sessionIds) ? payload.sessionIds : [];
       const changeScope = changedSessionIds.length > 0

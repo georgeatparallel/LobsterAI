@@ -11,7 +11,7 @@ import { RemoteStore } from './remoteStore';
 
 export interface ProjectionWork {
   database: string; target: string; sessionId: string; owner: RemoteOwner; deviceId: string; environment: string | null;
-  agent: RemoteAgentSummary | null; approval: boolean; questions: boolean; input: boolean; files: boolean; reply: boolean;
+  deletions?: boolean; agent: RemoteAgentSummary | null; approval: boolean; questions: boolean; input: boolean; files: boolean; reply: boolean;
 }
 /** Runs only in a worker: consistent source read, bounded disk materialization, then projection. */
 function materialize(work: ProjectionWork): { revision: number; sourceSeq: number; targetSourceSeq: number; digest: string } {

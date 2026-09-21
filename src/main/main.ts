@@ -602,6 +602,7 @@ import { RemoteSecurityCoordinator } from './remote/remoteSecurityCoordinator';
 import { RemoteSecurityJournal, RemoteSecurityJournalWorkerIo } from './remote/remoteSecurityJournal';
 import { PREVENT_SLEEP_STORE_KEY, RemoteSettingsController } from './remote/remoteSettingsController';
 import { assertRemoteExecutionPermit,currentRemoteExecution, markRemoteExecutionDispatched, SessionCommandService } from './remote/sessionCommandService';
+import { SessionDeletionService } from './remote/sessionDeletionService';
 import { SkillManager } from './skills/skillManager';
 import { getSkillServiceManager } from './skills/skillServices';
 import {
@@ -5653,6 +5654,46 @@ if (!gotTheLock) {
     return response;
   };
 
+  let sessionDeletionService: SessionDeletionService | null = null;
+  const getSessionDeletionService = (): SessionDeletionService => {
+    sessionDeletionService ??= new SessionDeletionService(getCoworkStore(), getCoworkEngineRouter(), sessionId => {
+      let cleanupFailed = false;
+      try {
+        mediaSelectionBySession.delete(sessionId);
+        mediaTurnAccountScopeBySession.delete(sessionId);
+        skinRuntimeController?.handleSessionDeleted(sessionId);
+        mediaReferencesBySession.delete(sessionId);
+        getDesktopNotificationManager().handleSessionDeleted(sessionId);
+        // Remove any pending media tasks for this session
+        for (const [taskId, tracker] of pendingMediaTasks) {
+          if (tracker.sessionId === sessionId) pendingMediaTasks.delete(taskId);
+        }
+        clearHandledMediaTasksForSession(sessionId);
+        clearMediaStatusPollCountsForSession(sessionId);
+        // Clean up IM session mapping so that new channel messages
+        // create a fresh session instead of referencing a deleted one.
+        try {
+          getIMGatewayManager()?.getIMStore()?.deleteSessionMappingByCoworkSessionId(sessionId);
+        } catch {
+          cleanupFailed = true;
+        }
+        // Notify runtime to purge in-memory caches for this session
+        // so that channel messages can create a fresh session.
+        try {
+          getCoworkEngineRouter().onSessionDeleted(sessionId);
+        } catch {
+          cleanupFailed = true;
+        }
+      } finally {
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(CoworkIpcChannel.SessionsChanged, { sessionIds: [sessionId], deletedSessionIds: [sessionId] });
+        }
+      }
+      if (cleanupFailed) throw new Error('Session runtime cleanup is pending');
+    }, getCurrentRemoteOwner);
+    return sessionDeletionService;
+  };
+
   const initializeRemoteBridge = (): RemoteBridge => {
     if (remoteBridge) return remoteBridge;
     const identity = loadRemoteIdentity(app.getPath('appData'), app.getPath('userData'), safeStorage);
@@ -5684,6 +5725,7 @@ if (!gotTheLock) {
     remoteSessionCommands!.configureInput({ models, preparations, getDeviceId: () => remoteBridge?.state().deviceId });
     remoteBridge = new RemoteBridge({
       security,
+      deletion: { service: getSessionDeletionService(), runtime: getCoworkEngineRouter(), reconcileStop: id => remoteSessionCommands!.reconcileSession(id) },
       input: { models, preparations },
       files: { cacheRoot: path.join(app.getPath('userData'), 'remote-file-uploads'), access: filePath => captureLibraryFileAccess(filePath) },
       getAgentDefaultInput: (owner, deviceId, agentId) => {
@@ -5778,6 +5820,7 @@ if (!gotTheLock) {
   const initializeRemoteControl = (): void => {
     // Store-backed services and listeners must wait for initApp's database initialization.
     getCoworkStore().remoteCreationOwner = getCurrentRemoteOwner;
+    getSessionDeletionService();
     try {
       remoteLocalGc ??= new RemoteLocalGc({ store: getCoworkStore().remote,
         cacheRoot: path.join(app.getPath('userData'), 'remote-file-uploads'), inputCacheRoot: path.join(app.getPath('userData'), 'remote-inputs'), owner: getCurrentRemoteOwner,
@@ -10419,38 +10462,11 @@ if (!gotTheLock) {
     let release: (() => void) | null = null;
     try {
       getCoworkStore().remote.assertActor(sessionId, getCurrentRemoteOwner());
-      release = ownershipOperationGate.beginOperation({
-        agentIds: [getCoworkStore().getSession(sessionId, 0)?.agentId || AgentId.Main], sessionIds: [sessionId],
+      release = ownershipOperationGate.tryAcquire({
+        agentIds: [], sessionIds: [sessionId],
       });
       if (!release) throw new Error(t('ownershipOperationBusy'));
-      getCoworkEngineRouter().stopSession(sessionId);
-      const coworkStoreInstance = getCoworkStore();
-      coworkStoreInstance.deleteSession(sessionId);
-      mediaSelectionBySession.delete(sessionId);
-      mediaTurnAccountScopeBySession.delete(sessionId);
-      skinRuntimeController?.handleSessionDeleted(sessionId);
-      mediaReferencesBySession.delete(sessionId);
-      getDesktopNotificationManager().handleSessionDeleted(sessionId);
-      // Remove any pending media tasks for this session
-      for (const [taskId, tracker] of pendingMediaTasks) {
-        if (tracker.sessionId === sessionId) pendingMediaTasks.delete(taskId);
-      }
-      clearHandledMediaTasksForSession(sessionId);
-      clearMediaStatusPollCountsForSession(sessionId);
-      // Clean up IM session mapping so that new channel messages
-      // create a fresh session instead of referencing a deleted one.
-      try {
-        getIMGatewayManager()?.getIMStore()?.deleteSessionMappingByCoworkSessionId(sessionId);
-      } catch {
-        // IM store may not be initialised yet; safe to ignore.
-      }
-      // Notify runtime to purge in-memory caches for this session
-      // so that channel messages can create a fresh session.
-      try {
-        getCoworkEngineRouter().onSessionDeleted(sessionId);
-      } catch {
-        // Router may not be initialised yet; safe to ignore.
-      }
+      await getSessionDeletionService().deleteLocal(sessionId);
       return { success: true };
     } catch (error) {
       return {
@@ -10463,32 +10479,12 @@ if (!gotTheLock) {
   ipcMain.handle(CoworkIpcChannel.DeleteSessions, async (_event, sessionIds: string[]) => {
     let release: (() => void) | null = null;
     try {
-      const runtime = getCoworkEngineRouter();
       sessionIds.forEach(sessionId => getCoworkStore().remote.assertActor(sessionId, getCurrentRemoteOwner()));
-      release = ownershipOperationGate.beginOperation({
-        agentIds: sessionIds.map(id => getCoworkStore().getSession(id, 0)?.agentId || AgentId.Main), sessionIds,
+      release = ownershipOperationGate.tryAcquire({
+        agentIds: [], sessionIds,
       });
       if (!release) throw new Error(t('ownershipOperationBusy'));
-      sessionIds.forEach(sessionId => {
-        runtime.stopSession(sessionId);
-      });
-      const coworkStoreInstance = getCoworkStore();
-      coworkStoreInstance.deleteSessions(sessionIds);
-      const router = getCoworkEngineRouter();
-      for (const sessionId of sessionIds) {
-        skinRuntimeController?.handleSessionDeleted(sessionId);
-        getDesktopNotificationManager().handleSessionDeleted(sessionId);
-        try {
-          getIMGatewayManager()?.getIMStore()?.deleteSessionMappingByCoworkSessionId(sessionId);
-        } catch {
-          // IM store may not be initialised yet; safe to ignore.
-        }
-        try {
-          router.onSessionDeleted(sessionId);
-        } catch {
-          // Router may not be initialised yet; safe to ignore.
-        }
-      }
+      await getSessionDeletionService().deleteLocalBatch(sessionIds);
       return { success: true };
     } catch (error) {
       return {
